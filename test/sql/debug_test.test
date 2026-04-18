@@ -1,0 +1,21 @@
+# name: test/sql/debug_test.test
+# description: debug
+# group: [sql]
+
+require smart_autocomplete
+
+statement ok
+CREATE SCHEMA col_ac
+
+statement ok
+CREATE TABLE col_ac.base_a(a_id INTEGER, a_shared INTEGER, a_only INTEGER)
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'col_ac' AND table_name = 'base_a'
+----
+1
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l WHERE l.a', max_suggestion_count => 200) WHERE suggestion_type = 'column'
+----
+3

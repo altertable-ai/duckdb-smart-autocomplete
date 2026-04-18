@@ -1,0 +1,15 @@
+# name: test/sql/check.test
+# group: [sql]
+
+require smart_autocomplete
+
+statement ok
+CREATE SCHEMA col_ac
+
+statement ok
+CREATE TABLE col_ac.base_a(a_id INTEGER, a_shared INTEGER, a_only INTEGER)
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l WHERE l.a') WHERE suggestion_type = 'column'
+----
+3

@@ -1,11 +1,13 @@
-# Testing this extension
-This directory contains all the tests for this extension. The `sql` directory holds tests that are written as [SQLLogicTests](https://duckdb.org/dev/sqllogictest/intro.html). DuckDB aims to have most its tests in this format as SQL statements, so for the quack extension, this should probably be the goal too.
+# Tests
 
-The root makefile contains targets to build and run all of these tests. To run the SQLLogicTests:
+SQL tests live under `sql/` as [SQLLogic tests](https://duckdb.org/dev/sqllogictest/intro.html). Autocomplete coverage lives alongside other SQL tests in `sql/` (ported from the in-tree DuckDB suite, with `sql_auto_complete` renamed to `sql_smart_auto_complete` and `require smart_autocomplete`).
+
+From the repository root:
+
 ```bash
 make test
-```
-or 
-```bash
+# or
 make test_debug
 ```
+
+Ensure a `data` symlink exists (`ln -sfn duckdb/data data`) so `{DATA_DIR}` resolves for file-suggestion tests on Unix/macOS.

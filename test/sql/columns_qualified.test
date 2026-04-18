@@ -1,0 +1,314 @@
+# name: test/sql/columns_qualified.test
+# description: Column completion with schema.table qualifiers (parse_tree_walk + catalog filtering)
+# group: [sql]
+
+require smart_autocomplete
+
+statement ok
+CREATE SCHEMA col_ac;
+
+statement ok
+CREATE TABLE col_ac.base_a(a_id INTEGER, a_shared INTEGER, a_only INTEGER);
+
+statement ok
+CREATE TABLE col_ac.base_b(b_id INTEGER, a_shared INTEGER, b_only INTEGER);
+
+statement ok
+CREATE SCHEMA col_sch;
+
+statement ok
+CREATE SCHEMA other_sch;
+
+statement ok
+CREATE TABLE col_sch.t_alpha(idx INTEGER, nm VARCHAR, nested_key INTEGER);
+
+statement ok
+CREATE TABLE other_sch.t_alpha(idx INTEGER, code VARCHAR);
+
+# SELECT list: schema.table partial — only columns from that relation
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_only', 'a_shared', 'b_only') ORDER BY suggestion;
+----
+a_id	column
+a_only	column
+a_shared	column
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion = 'b_only' AND suggestion_type = 'column';
+----
+0
+
+# Second physical table: no columns exclusive to base_a
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT col_ac.base_b.b', max_suggestion_count => 200) WHERE suggestion IN ('a_only', 'b_id', 'b_only') ORDER BY suggestion;
+----
+b_id	column
+b_only	column
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT col_ac.base_b.b', max_suggestion_count => 200) WHERE suggestion = 'a_only' AND suggestion_type = 'column';
+----
+0
+
+# JOIN ON: qualifier pins to left table
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a JOIN col_ac.base_b ON col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion;
+----
+a_id	column	0
+a_only	column	0
+a_shared	column	0
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a JOIN col_ac.base_b ON col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion = 'b_only' AND suggestion_type = 'column';
+----
+0
+
+# JOIN WHERE: right-hand schema.table partial
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a JOIN col_ac.base_b ON true WHERE col_ac.base_b.b', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion;
+----
+b_id	column	0
+b_only	column	0
+a_shared	column	2
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a JOIN col_ac.base_b ON true WHERE col_ac.base_b.b', max_suggestion_count => 200) WHERE suggestion = 'a_only' AND suggestion_type = 'column';
+----
+0
+
+# Single-level derived table: innermost WHERE still resolves base_a columns
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT * FROM (SELECT * FROM col_ac.base_a WHERE col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion;
+----
+a_id	column	0
+a_only	column	0
+a_shared	column	0
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM (SELECT * FROM col_ac.base_a WHERE col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion = 'b_only' AND suggestion_type = 'column';
+----
+0
+
+# Double-nested derived tables
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT * FROM (SELECT * FROM (SELECT * FROM col_ac.base_a WHERE col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion;
+----
+a_id	column	0
+a_only	column	0
+a_shared	column	0
+
+# Comma-separated FROM (subquery + base table): WHERE qualifier still base_a
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT * FROM (SELECT 1) z, col_ac.base_a WHERE col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion;
+----
+a_id	column	0
+a_only	column	0
+a_shared	column	0
+
+# Leading WITH: outer FROM slice — same column qualification
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH w AS (SELECT 1) SELECT * FROM col_ac.base_a WHERE col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion;
+----
+a_id	column	0
+a_only	column	0
+a_shared	column	0
+
+# Nested WITH: cursor in innermost incomplete SELECT — columns from inner physical FROM only
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH outer_cte AS (WITH inner_cte AS (SELECT * FROM col_ac.base_a WHERE col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion;
+----
+a_id	column	0
+a_only	column	0
+a_shared	column	0
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('WITH outer_cte AS (WITH inner_cte AS (SELECT * FROM col_ac.base_a WHERE col_ac.base_a.a', max_suggestion_count => 200) WHERE suggestion = 'b_only' AND suggestion_type = 'column';
+----
+0
+
+# Same relation name in two schemas: partial column list must not pull the other schema's columns
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT col_sch.t_alpha.n', max_suggestion_count => 200) WHERE suggestion IN ('code', 'nested_key', 'nm') ORDER BY suggestion;
+----
+nested_key	column
+nm	column
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT col_sch.t_alpha.n', max_suggestion_count => 200) WHERE suggestion = 'code' AND suggestion_type = 'column';
+----
+0
+
+# Quoted catalog path: same filtering as unquoted schema.table
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT "col_ac"."base_a".a', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion;
+----
+a_id	column	0
+a_only	column	0
+a_shared	column	0
+
+# ---------------------------------------------------------------------------
+# Tier A — BaseTableRef alias in WHERE / ORDER BY / GROUP BY / HAVING /
+#           QUALIFY / JOIN ON
+# ---------------------------------------------------------------------------
+
+# WHERE: alias-qualified partial — only base_a columns
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l WHERE l.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_only', 'a_shared', 'b_only') ORDER BY suggestion;
+----
+a_id	column
+a_only	column
+a_shared	column
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l WHERE l.a', max_suggestion_count => 200) WHERE suggestion = 'b_only' AND suggestion_type = 'column';
+----
+0
+
+# ORDER BY: alias-qualified partial
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l ORDER BY l.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_only', 'a_shared') ORDER BY suggestion;
+----
+a_id	column
+a_only	column
+a_shared	column
+
+# GROUP BY: alias-qualified partial
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l GROUP BY l.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_only', 'a_shared') ORDER BY suggestion;
+----
+a_id	column
+a_only	column
+a_shared	column
+
+# HAVING: alias-qualified partial
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT l.a_id FROM col_ac.base_a l GROUP BY l.a_id HAVING l.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_only', 'a_shared') ORDER BY suggestion;
+----
+a_id	column
+a_only	column
+a_shared	column
+
+# QUALIFY: alias-qualified partial
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l QUALIFY l.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_only', 'a_shared') ORDER BY suggestion;
+----
+a_id	column
+a_only	column
+a_shared	column
+
+# JOIN ON: left alias pins to base_a
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l JOIN col_ac.base_b r ON l.a_id = r.b_id WHERE l.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_only', 'a_shared', 'b_only') ORDER BY suggestion;
+----
+a_id	column
+a_only	column
+a_shared	column
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l JOIN col_ac.base_b r ON l.a_id = r.b_id WHERE l.a', max_suggestion_count => 200) WHERE suggestion = 'b_only' AND suggestion_type = 'column';
+----
+0
+
+# JOIN: right alias r. returns only base_b exclusive columns (plus shared)
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l JOIN col_ac.base_b r ON l.a_id = r.b_id WHERE r.b', max_suggestion_count => 200) WHERE suggestion IN ('a_only', 'b_id', 'b_only') ORDER BY suggestion;
+----
+b_id	column
+b_only	column
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_a l JOIN col_ac.base_b r ON l.a_id = r.b_id WHERE r.b', max_suggestion_count => 200) WHERE suggestion = 'a_only' AND suggestion_type = 'column';
+----
+0
+
+# Scope isolation: cursor inside subquery sees inner FROM only
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_b outer_b WHERE outer_b.b_id IN (SELECT * FROM col_ac.base_a inner_a WHERE inner_a.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_only', 'a_shared', 'b_only') ORDER BY suggestion;
+----
+a_id	column
+a_only	column
+a_shared	column
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM col_ac.base_b outer_b WHERE outer_b.b_id IN (SELECT * FROM col_ac.base_a inner_a WHERE inner_a.a', max_suggestion_count => 200) WHERE suggestion = 'b_only' AND suggestion_type = 'column';
+----
+0
+
+# ---------------------------------------------------------------------------
+# Tier B — Subquery aliases
+# ---------------------------------------------------------------------------
+
+# Explicit column list in subquery
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM (SELECT a_id, a_shared FROM col_ac.base_a) sub WHERE sub.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_shared', 'a_only') ORDER BY suggestion;
+----
+a_id	column
+a_shared	column
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM (SELECT a_id, a_shared FROM col_ac.base_a) sub WHERE sub.a', max_suggestion_count => 200) WHERE suggestion = 'a_only' AND suggestion_type = 'column';
+----
+0
+
+# Star expansion in subquery: SELECT * defers to catalog lookup via star_sources.
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM (SELECT * FROM col_ac.base_a) sub WHERE sub.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_only', 'a_shared') AND suggestion_type = 'column' ORDER BY suggestion;
+----
+a_id	column
+a_only	column
+a_shared	column
+
+# Full result set including suggestion_score for the star-subquery alias:
+query III
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT * FROM (SELECT * FROM col_ac.base_a) sub WHERE sub.a', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion;
+----
+a_id	column	0
+a_only	column	0
+a_shared	column	0
+
+# Isolation: subquery alias does not leak other table's exclusive column
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM (SELECT a_id, a_shared FROM col_ac.base_a) sub WHERE sub.b', max_suggestion_count => 200) WHERE suggestion = 'b_only' AND suggestion_type = 'column';
+----
+0
+
+# ---------------------------------------------------------------------------
+# Tier C — CTE aliases
+# ---------------------------------------------------------------------------
+
+# Simple WITH: CTE alias in main SELECT WHERE
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('WITH w AS (SELECT a_id, a_shared FROM col_ac.base_a) SELECT * FROM w WHERE w.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_shared', 'a_only') ORDER BY suggestion;
+----
+a_id	column
+a_shared	column
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('WITH w AS (SELECT a_id, a_shared FROM col_ac.base_a) SELECT * FROM w WHERE w.a', max_suggestion_count => 200) WHERE suggestion = 'a_only' AND suggestion_type = 'column';
+----
+0
+
+# CTE does not suggest columns from base table it did not project
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('WITH w AS (SELECT a_id FROM col_ac.base_a) SELECT * FROM w WHERE w.a', max_suggestion_count => 200) WHERE suggestion = 'a_shared' AND suggestion_type = 'column';
+----
+0
+
+# RECURSIVE CTE: first-branch columns are synthesized
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('WITH RECURSIVE rec AS (SELECT a_id, a_shared FROM col_ac.base_a UNION ALL SELECT a_id, a_shared FROM rec) SELECT * FROM col_ac.base_a WHERE rec.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_shared', 'a_only') ORDER BY suggestion;
+----
+a_id	column
+a_shared	column
+
+# RECURSIVE CTE with InsertColumnList (column names from the r(n) declaration)
+query III
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n < 3) SELECT * FROM r WHERE r.n', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+n	column	0
+
+# Outer CTE referenced in outer SELECT — not visible inside inner CTE subquery scope
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('WITH outer_w AS (SELECT a_id FROM col_ac.base_a) SELECT * FROM col_ac.base_a WHERE outer_w.a', max_suggestion_count => 200) WHERE suggestion IN ('a_id', 'a_shared', 'a_only') ORDER BY suggestion;
+----
+a_id	column

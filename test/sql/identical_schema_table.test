@@ -1,0 +1,16 @@
+# name: test/sql/identical_schema_table.test
+# description: Test sql_smart_auto_complete
+# group: [sql]
+
+require smart_autocomplete
+
+statement ok
+CREATE SCHEMA my_catalog_entry;
+
+statement ok
+CREATE TABLE my_catalog_entry(i INT);
+
+query II
+SELECT suggestion, suggestion_start FROM sql_smart_auto_complete('FROM my_c') LIMIT 1;
+----
+my_catalog_entry	5

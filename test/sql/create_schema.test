@@ -1,0 +1,35 @@
+# name: test/sql/create_schema.test
+# description: Test sql_smart_auto_complete
+# group: [sql]
+
+require smart_autocomplete
+
+query III
+SELECT suggestion, suggestion_start, suggestion_type FROM sql_smart_auto_complete('CREATE SCH') LIMIT 1;
+----
+SCHEMA 	7	keyword
+
+query II
+SELECT suggestion, suggestion_start FROM sql_smart_auto_complete('CREATE SCHEMA I') LIMIT 1;
+----
+IF 	14
+
+query II
+SELECT suggestion, suggestion_start FROM sql_smart_auto_complete('CREATE SCHEMA IF NO') LIMIT 1;
+----
+NOT 	17
+
+query II
+SELECT suggestion, suggestion_start FROM sql_smart_auto_complete('CREATE SCHEMA IF NOT EX') LIMIT 1;
+----
+EXISTS 	21
+
+# attached database
+# suggest a catalog
+statement ok
+ATTACH ':memory:' AS attached_in_memory;
+
+query II
+SELECT suggestion, suggestion_start FROM sql_smart_auto_complete('CREATE SCHEMA attac') LIMIT 1;
+----
+attached_in_memory.	14

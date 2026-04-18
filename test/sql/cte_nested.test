@@ -1,0 +1,160 @@
+# name: test/sql/cte_nested.test
+# description: Autocomplete with CTEs and nested FROM (parse_tree_walk / qualifier paths)
+# group: [sql]
+
+require smart_autocomplete
+
+statement ok
+CREATE SCHEMA s;
+
+statement ok
+CREATE TABLE s.cte_tbl(id INTEGER, name VARCHAR, idx INTEGER, iota INTEGER);
+
+statement ok
+CREATE TABLE s.inner_only(x INTEGER);
+
+statement ok
+CREATE TABLE s.ct_other(y INTEGER);
+
+statement ok
+CREATE SCHEMA other_ct_sch;
+
+statement ok
+CREATE TABLE other_ct_sch.ct_elsewhere(w INTEGER);
+
+# Same `ct*` name prefix exists outside `s`; must not leak into `s.ct` completions
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('WITH w AS (SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion = 'ct_elsewhere';
+----
+0
+
+# Under the other schema, that table is the relevant `ct*` match
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT * FROM other_ct_sch.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_elsewhere	table	0
+
+# Same completion: explicit row that `ct_elsewhere` is returned (and where it starts)
+query II
+SELECT suggestion, suggestion_start FROM sql_smart_auto_complete('SELECT * FROM other_ct_sch.ct', max_suggestion_count => 200) WHERE suggestion = 'ct_elsewhere' LIMIT 1;
+----
+ct_elsewhere	27
+
+# Default schema-qualified partial `...ct`: top tables by score, then name
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH w AS (SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# Multiple CTEs: same ranking in the second CTE's FROM clause
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH a AS (SELECT 1), b AS (SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# Nested derived tables: innermost FROM
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT * FROM (SELECT * FROM (SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# Comma-separated FROM: subquery alias then schema-qualified table
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('SELECT * FROM (SELECT 1) x, s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# Quoted path: different score curve (still schema-filtered)
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH w AS (SELECT * FROM "s"."cte_t', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+cte_tbl	table	2
+ct_other	table	4
+inner_only	table	8
+
+# Leading WITH on outer query
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH w AS (SELECT 1) SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# Keywords after long FROM: best keyword first, then next plausible clause keywords
+query TTI
+SELECT trim(suggestion), suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH w AS (SELECT 1) SELECT * FROM s.cte_tbl WH', max_suggestion_count => 50) WHERE suggestion_type = 'keyword' ORDER BY suggestion_score ASC, trim(suggestion) LIMIT 3;
+----
+WHERE	keyword	0
+HAVING	keyword	2
+WINDOW	keyword	2
+
+# --- Heavier CTE / nesting (many FROM branches; stresses parse_tree_walk + FROM matching) ---
+
+# Nested WITH: inner CTE reads a base table; outer CTE reads inner_cte by name; main SELECT completes catalog table
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH outer_cte AS (WITH inner_cte AS (SELECT * FROM s.inner_only) SELECT * FROM inner_cte) SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# Partial inside innermost physical FROM (`inn`): inner_only best, then weaker matches
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH outer_cte AS (WITH inner_cte AS (SELECT * FROM s.inn', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+inner_only	table	0
+ct_other	table	6
+cte_tbl	table	6
+
+# CTE body with JOIN + ON referencing both tables; trailing completion is still the outer main FROM
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH w AS (SELECT * FROM s.inner_only JOIN s.cte_tbl ON inner_only.x = cte_tbl.id) SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# UNION ALL inside CTE (two FROM branches) then outer SELECT
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH u AS (SELECT * FROM s.inner_only UNION ALL SELECT * FROM s.cte_tbl) SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# Scalar subquery and a derived FROM in the same CTE SELECT list (FROM token appears before the CTE's main FROM)
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH w AS (SELECT (SELECT max(x) FROM s.inner_only) AS mx, y FROM (SELECT 1 AS y) sub) SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# Second CTE joins a prior CTE name to a base table (parser tree mixes CTE refs and BaseTableRef)
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH a AS (SELECT * FROM s.inner_only), b AS (SELECT * FROM a JOIN s.cte_tbl ON true) SELECT * FROM s.ct', max_suggestion_count => 200) WHERE suggestion_type = 'table' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+ct_other	table	0
+cte_tbl	table	0
+inner_only	table	4
+
+# Outer WHERE: qualified `...cte_tbl.i` — top column matches (same score, stable by name)
+query TTI
+SELECT suggestion, suggestion_type, suggestion_score FROM sql_smart_auto_complete('WITH a AS (SELECT * FROM s.inner_only) SELECT * FROM s.cte_tbl WHERE s.cte_tbl.i', max_suggestion_count => 200) WHERE suggestion_type = 'column' ORDER BY suggestion_score ASC, suggestion LIMIT 3;
+----
+id	column	0
+idx	column	0
+iota	column	0
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('WITH a AS (SELECT * FROM s.inner_only) SELECT * FROM s.cte_tbl WHERE s.cte_tbl.i', max_suggestion_count => 200) WHERE suggestion = 'x' AND suggestion_type = 'column';
+----
+0
