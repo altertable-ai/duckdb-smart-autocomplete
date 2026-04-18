@@ -4,7 +4,7 @@ This document describes the PEG (Parsing Expression Grammar) system used by Duck
 
 ## Grammar Syntax
 
-Grammar rules are defined in `.gram` files located in `src/grammar/statements/`. Each file typically corresponds to one SQL statement type (e.g., `select.gram`, `insert.gram`, `alter.gram`).
+Grammar rules are defined in `.gram` files under `duckdb/extension/autocomplete/grammar/statements/` (DuckDB submodule). Each file typically corresponds to one SQL statement type (e.g., `select.gram`, `insert.gram`, `alter.gram`).
 
 ### Rule Definitions
 
@@ -126,7 +126,7 @@ Expression <- LambdaArrowExpression
 
 ### Keywords
 
-Keywords are defined in list files under `grammar/keywords/`:
+Keywords are defined in list files under `duckdb/extension/autocomplete/grammar/keywords/`:
 
 | File | Description |
 |------|-------------|
@@ -138,30 +138,14 @@ Keywords are defined in list files under `grammar/keywords/`:
 
 A keyword must appear in exactly one list. The build script validates this.
 
-## Building the Grammar
+## Grammar outputs
 
-After modifying `.gram` files or keyword lists, regenerate the inlined grammar files:
+This extension does not ship a grammar generator. The merged PEG grammar and keyword maps are the **committed artifacts** next to the grammar in the DuckDB tree:
 
-```bash
-./scripts/build_peg_grammar.sh
-```
+- `duckdb/extension/autocomplete/include/inlined_grammar.hpp`
+- `duckdb/extension/autocomplete/keyword_map.cpp`
 
-**Prerequisites**: A Python virtual environment at `.venv` in the repository root.
-
-This script runs `src/inline_grammar.py` twice:
-
-1. **`--grammar-file`**: Combines all `.gram` files and keyword lists into a single `inlined_grammar.gram` (useful for debugging).
-2. **Default**: Generates `inlined_grammar.hpp` (C++ header embedding the grammar as a string constant) and `keyword_map.cpp` (keyword lookup tables).
-
-### Generated Files
-
-| File | Description |
-|------|-------------|
-| `include/inlined_grammar.gram` | Complete merged grammar (all `.gram` files + keywords) |
-| `include/inlined_grammar.hpp` | C++ header: `const char INLINED_PEG_GRAMMAR[]` |
-| `keyword_map.cpp` | C++ keyword category lookup maps |
-
-**Do not edit generated files manually** — they will be overwritten by the build script.
+They stay in lockstep with the `duckdb` submodule tag you build against. To change grammar or keywords, edit upstream DuckDB (or your fork of it), regenerate there if your workflow requires it, then bump the submodule here.
 
 ## Implementing Transformer Rules
 
