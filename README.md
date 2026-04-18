@@ -1,25 +1,8 @@
 # DuckDB Smart Autocomplete
 
-Out-of-tree [DuckDB](https://duckdb.org) extension that exposes the experimental **PEG-based SQL autocomplete** stack: catalog-aware suggestions (schemas, tables, columns, functions, files, keywords) plus optional helpers for tokenization and SQL formatting.
+Out-of-tree [DuckDB](https://duckdb.org) extension that exposes the experimental **PEG-based SQL autocomplete** stack with catalog-aware suggestions (schemas, tables, columns, functions, files, keywords).
 
-The implementation is ported from the in-tree `extension/autocomplete` work on [duckdb/duckdb](https://github.com/duckdb/duckdb) so it can ship and iterate without waiting for upstream merge. CI builds against that fork’s `main` branch, which carries the parser and AST headers this code expects.
-
-## Install (from a repository)
-
-Once published to a repository (for example [community extensions](https://duckdb.org/community_extensions/overview)):
-
-```sql
-INSTALL smart_autocomplete FROM community;
-LOAD smart_autocomplete;
-```
-
-For unsigned local builds:
-
-```sql
-LOAD '/path/to/smart_autocomplete.duckdb_extension';
-```
-
-You may need `allow_unsigned_extensions` / `duckdb -unsigned` depending on how the binary was produced.
+The implementation is ported from the in-tree `extension/autocomplete` work on [duckdb/duckdb](https://github.com/duckdb/duckdb) so it can ship and iterate without waiting for upstream merge.
 
 ## Main API
 
@@ -32,7 +15,7 @@ This extension registers the same **PEG parser extension** hook as the in-tree `
 ## Quick try
 
 ```sql
-LOAD smart_autocomplete;  -- omit if built-in / autoloaded
+LOAD smart_autocomplete;
 FROM sql_smart_auto_complete('SELECT * FRO');
 ```
 
