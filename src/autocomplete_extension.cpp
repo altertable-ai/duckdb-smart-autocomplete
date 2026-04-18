@@ -13,16 +13,18 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "transformer/peg_transformer.hpp"
+#include "peg_transform_cached.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "matcher.hpp"
+#include "peg_matcher_cache.hpp"
 #include "autocomplete_catalog_provider.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/catalog/catalog_entry/pragma_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
-#include "parser/tokenizer/parser_tokenizer.hpp"
+#include "tokenizer.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 
@@ -188,6 +190,9 @@ static vector<AutoCompleteCandidate> SuggestType(ClientContext &context) {
 	auto all_entries = GetAllTypes(context);
 	for (auto &entry_ref : all_entries) {
 		auto &entry = entry_ref.get();
+		if (entry.name.empty()) {
+			continue;
+		}
 		// prioritize user-defined types
 		int32_t bonus = (entry.internal) ? 0 : 1;
 		suggestions.emplace_back(entry.name, SuggestionState::SUGGEST_TYPE_NAME, bonus, CandidateType::KEYWORD);
@@ -199,7 +204,11 @@ static void AppendColumnsFromEntry(CatalogEntry &entry, vector<AutoCompleteCandi
 		auto &table = entry.Cast<TableCatalogEntry>();
 		int32_t bonus = entry.internal ? 0 : 3;
 		for (auto &col : table.GetColumns().Logical()) {
-			suggestions.emplace_back(col.GetName(), SuggestionState::SUGGEST_COLUMN_NAME, bonus);
+			auto col_name = col.GetName();
+			if (col_name.empty()) {
+				continue;
+			}
+			suggestions.emplace_back(std::move(col_name), SuggestionState::SUGGEST_COLUMN_NAME, bonus);
 		}
 	} else if (entry.type == CatalogType::VIEW_ENTRY) {
 		auto &view = entry.Cast<ViewCatalogEntry>();
@@ -216,7 +225,7 @@ static void AppendColumnsFromEntry(CatalogEntry &entry, vector<AutoCompleteCandi
 			}
 		}
 	} else {
-		if (StringUtil::CharacterIsOperator(entry.name[0])) {
+		if (entry.name.empty() || StringUtil::CharacterIsOperator(entry.name[0])) {
 			return;
 		}
 		int32_t bonus = entry.internal ? 0 : 2;
@@ -613,6 +622,24 @@ void SQLAutoCompleteFunction(ClientContext &context, TableFunctionInput &data_p,
 	output.SetCardinality(count);
 }
 
+class ParserTokenizer : public BaseTokenizer {
+public:
+	explicit ParserTokenizer(const string &sql, vector<MatcherToken> &tokens) : BaseTokenizer(sql, tokens) {
+	}
+	void OnStatementEnd(idx_t pos) override {
+		statements.push_back(std::move(tokens));
+		tokens.clear();
+	}
+	void OnLastToken(TokenizeState state, string last_word, idx_t last_pos) override {
+		if (last_word.empty()) {
+			return;
+		}
+		tokens.emplace_back(std::move(last_word), last_pos);
+	}
+
+	vector<vector<MatcherToken>> statements;
+};
+
 class PEGParserExtension : public ParserExtension {
 public:
 	PEGParserExtension() {
@@ -621,14 +648,17 @@ public:
 	}
 
 	static ParserOverrideResult PEGParser(ParserExtensionInfo *info, const string &query, ParserOptions &options) {
-		auto &cache = info->Cast<PEGMatcherCache>();
-		auto peg_matcher = cache.GetMatcher();
-		auto &root_matcher = peg_matcher->Root();
+		auto *cache_ptr = dynamic_cast<PEGMatcherCache *>(info);
+		if (!cache_ptr) {
+			throw InternalException("smart_autocomplete: parser extension info is not PEGMatcherCache");
+		}
+		auto peg_matcher = cache_ptr->GetMatcher();
 
 		vector<MatcherToken> root_tokens;
 		string clean_sql;
+		const string &sql_ref = StripUnicodeSpaces(query, clean_sql) ? clean_sql : query;
 
-		ParserTokenizer tokenizer(query, root_tokens);
+		ParserTokenizer tokenizer(sql_ref, root_tokens);
 		tokenizer.TokenizeInput();
 		tokenizer.statements.push_back(std::move(root_tokens));
 
@@ -638,13 +668,14 @@ public:
 				if (tokenized_statement.empty()) {
 					continue;
 				}
-				auto statement = PEGTransformerFactory::Transform(tokenized_statement, options, root_matcher);
-				if (statement) {
-					statement->stmt_location = NumericCast<idx_t>(tokenized_statement[0].offset);
-					auto last_pos = tokenized_statement[tokenized_statement.size() - 1].offset +
-					                tokenized_statement[tokenized_statement.size() - 1].length;
-					statement->stmt_length = last_pos - tokenized_statement[0].offset;
+				auto statement = PEGTransformWithCachedMatcher(tokenized_statement, options, peg_matcher);
+				if (!statement) {
+					continue;
 				}
+				statement->stmt_location = NumericCast<idx_t>(tokenized_statement[0].offset);
+				auto last_pos = tokenized_statement[tokenized_statement.size() - 1].offset +
+				                tokenized_statement[tokenized_statement.size() - 1].length;
+				statement->stmt_length = last_pos - tokenized_statement[0].offset;
 				statement->query = query;
 				result.push_back(std::move(statement));
 			}

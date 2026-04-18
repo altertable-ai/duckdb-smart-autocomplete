@@ -9,6 +9,7 @@
 #pragma once
 
 #include "autocomplete_qualifier.hpp"
+#include "peg_matcher_cache.hpp"
 
 namespace duckdb {
 

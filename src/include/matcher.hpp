@@ -1,8 +1,11 @@
 //===----------------------------------------------------------------------===//
-//                         DuckDB
+//                         DuckDB (forked for smart_autocomplete)
 //
 // matcher.hpp
 //
+// Shadows duckdb/extension/autocomplete/include/matcher.hpp: same layout for
+// stock autocomplete types, plus TokenType / MatcherToken / MatcherSuggestion
+// fields used only by this extension. Keeps the duckdb submodule unmodified.
 //
 //===----------------------------------------------------------------------===//
 
@@ -11,9 +14,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/reference_map.hpp"
-#include "duckdb/parser/parser_extension.hpp"
 #include "transformer/parse_result.hpp"
-#include <mutex>
 
 namespace duckdb {
 class ParseResultAllocator;
@@ -83,7 +84,31 @@ enum class MatchResultType { SUCCESS, FAIL };
 
 enum class SuggestionType { OPTIONAL, MANDATORY };
 
+//! Token classification for qualifier / FROM-clause analysis (refined during PEG matching).
+enum class TokenType : uint8_t {
+	WORD,
+	KEYWORD,
+	IDENTIFIER,
+	CATALOG_NAME,
+	SCHEMA_NAME,
+	TABLE_NAME,
+	COLUMN_NAME,
+	TYPE_NAME,
+	SCALAR_FUNCTION,
+	TABLE_FUNCTION,
+	PRAGMA_FUNCTION,
+	SETTING_NAME,
+	STRING_LITERAL,
+	NUMBER_LITERAL,
+	OPERATOR
+};
+
 struct MatcherToken {
+	// NOLINTNEXTLINE: allow implicit conversion from text
+	MatcherToken(string text_p, idx_t offset_p)
+	    : type(TokenType::WORD), text(std::move(text_p)), offset(offset_p), unterminated(false) {
+		length = text.length();
+	}
 	// NOLINTNEXTLINE: allow implicit conversion from text
 	MatcherToken(string text_p, idx_t offset_p, TokenType type_p, bool unterminated_p = false)
 	    : type(type_p), text(std::move(text_p)), offset(offset_p), unterminated(unterminated_p) {
@@ -110,10 +135,9 @@ struct MatcherSuggestion {
 	AutoCompleteCandidate keyword;
 	SuggestionState type;
 	char extra_char = '\0';
-	//! Populated for catalog-aware filtering (see autocomplete_qualifier.hpp)
+	//! Dotted-qualifier context for catalog-backed suggestions (smart extension)
 	string catalog_context;
 	string schema_context;
-	//! For SUGGEST_COLUMN_NAME: qualifier before the column (table or alias)
 	string table_ref;
 };
 
@@ -166,6 +190,8 @@ public:
 	virtual string ToString() const = 0;
 	void Print() const;
 
+	static Matcher &RootMatcher(MatcherAllocator &allocator);
+
 	MatcherType Type() const {
 		return type;
 	}
@@ -210,40 +236,6 @@ public:
 
 private:
 	vector<unique_ptr<ParseResult>> parse_results;
-};
-
-struct PEGMatcher {
-	MatcherAllocator allocator;
-
-	Matcher &Root() {
-		return *root;
-	}
-
-	//! Second root: parses only `FromClause` (same grammar as `Root`, different entry rule).
-	Matcher &FromClauseRoot() {
-		return *from_clause_root;
-	}
-
-	//! Third root: parses only `WithClause` for CTE column synthesis.
-	Matcher &WithClauseRoot() {
-		return *with_clause_root;
-	}
-
-private:
-	friend struct PEGMatcherCache;
-	optional_ptr<Matcher> root;
-	optional_ptr<Matcher> from_clause_root;
-	optional_ptr<Matcher> with_clause_root;
-};
-
-//! Per-database cache holder for the compiled PEG root matcher.
-struct PEGMatcherCache : ParserExtensionInfo {
-	shared_ptr<PEGMatcher> GetMatcher();
-	void Invalidate();
-
-private:
-	std::mutex mutex;
-	shared_ptr<PEGMatcher> matcher;
 };
 
 } // namespace duckdb

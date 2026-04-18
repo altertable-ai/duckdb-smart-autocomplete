@@ -1,5 +1,6 @@
 #include "matcher.hpp"
 #include "autocomplete_qualifier.hpp"
+#include "peg_matcher_cache.hpp"
 
 // uncomment to dynamically read the PEG parser from a file instead of compiling it in (useful for testing)
 // #define PEG_PARSER_SOURCE_FILE "src/include/inlined_grammar.gram"
@@ -10,11 +11,12 @@
 #include "keyword_helper.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
-#include "include/parser/tokenizer/base_tokenizer.hpp"
+#include "tokenizer.hpp"
 #include "parser/peg_parser.hpp"
 #include "transformer/parse_result.hpp"
 #ifdef PEG_PARSER_SOURCE_FILE
 #include <fstream>
+#include <sstream>
 #else
 #include "inlined_grammar.hpp"
 #endif
@@ -58,6 +60,7 @@ public:
 		if (!MatchKeyword(state)) {
 			return MatchResultType::FAIL;
 		}
+		state.tokens[state.token_index - 1].type = TokenType::KEYWORD;
 		return MatchResultType::SUCCESS;
 	}
 
@@ -170,7 +173,7 @@ public:
 
 	optional_ptr<ParseResult> MatchParseResult(MatchState &state) const override {
 		MatchState list_state(state);
-		vector<reference<ParseResult>> results;
+		vector<optional_ptr<ParseResult>> results;
 
 		optional_idx start_offset;
 		if (list_state.token_index < list_state.tokens.size()) {
@@ -181,7 +184,7 @@ public:
 			if (!child_result) {
 				return nullptr;
 			}
-			results.push_back(*child_result);
+			results.push_back(child_result);
 		}
 		state.token_index = list_state.token_index;
 		// Empty name implies it's a subrule, e.g. 'SET'i (StandardAssignment / SetTimeZone)
@@ -373,7 +376,7 @@ public:
 
 	optional_ptr<ParseResult> MatchParseResult(MatchState &state) const override {
 		MatchState repeat_state(state);
-		vector<reference<ParseResult>> results;
+		vector<optional_ptr<ParseResult>> results;
 
 		optional_idx start_offset;
 		if (repeat_state.token_index < state.tokens.size()) {
@@ -386,7 +389,7 @@ public:
 			// The first match failed, so the whole repeat fails.
 			return nullptr;
 		}
-		results.push_back(*first_result);
+		results.push_back(first_result);
 
 		// After the first success, the overall result is a success.
 		// Now, we continue matching the element as many times as possible.
@@ -404,7 +407,7 @@ public:
 			if (!next_result) {
 				break;
 			}
-			results.push_back(*next_result);
+			results.push_back(next_result);
 		}
 
 		// Return all collected results in a RepeatParseResult.
@@ -1477,6 +1480,20 @@ shared_ptr<PEGMatcher> PEGMatcherCache::GetMatcher() {
 void PEGMatcherCache::Invalidate() {
 	std::unique_lock<std::mutex> lock(mutex);
 	matcher = nullptr;
+}
+
+Matcher &Matcher::RootMatcher(MatcherAllocator &allocator) {
+	MatcherFactory factory(allocator);
+#ifdef PEG_PARSER_SOURCE_FILE
+	std::ifstream t(PEG_PARSER_SOURCE_FILE);
+	std::stringstream buffer;
+	buffer << t.rdbuf();
+	auto string = buffer.str();
+
+	return factory.CreateMatcher(string.c_str(), "Statement");
+#else
+	return factory.CreateMatcher(const_char_ptr_cast(INLINED_PEG_GRAMMAR), "Statement");
+#endif
 }
 
 } // namespace duckdb

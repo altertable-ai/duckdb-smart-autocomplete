@@ -3,8 +3,7 @@
 #include "matcher.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
-#include "parser/tokenizer/parser_tokenizer.hpp"
-#include "include/parser/tokenizer/base_tokenizer.hpp"
+#include "tokenizer.hpp"
 
 namespace duckdb {
 
@@ -70,6 +69,9 @@ static vector<AutoCompleteSuggestion> ComputeSuggestions(vector<AutoCompleteCand
 		auto str = suggestion.candidate;
 		if (suggestion.extra_char != '\0') {
 			str += suggestion.extra_char;
+		}
+		if (str.empty()) {
+			continue;
 		}
 		auto bonus = suggestion.score_bonus;
 		if (matches.find(str) != matches.end()) {
@@ -300,7 +302,7 @@ public:
 	}
 
 	void OnLastToken(TokenizeState state, string last_word_p, idx_t last_pos_p) override {
-		if (TokenizeStateToType(state) == TokenType::STRING_LITERAL) {
+		if (state == TokenizeState::STRING_LITERAL) {
 			suggestions.emplace_back(SuggestionState::SUGGEST_FILE_NAME);
 		}
 		if (StringUtil::StartsWith(last_word_p, "'")) {

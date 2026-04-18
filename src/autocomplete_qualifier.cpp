@@ -6,6 +6,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "keyword_helper.hpp"
 #include "transformer/parse_result.hpp"
+#include <functional>
 
 namespace duckdb {
 
@@ -142,16 +143,29 @@ static idx_t ComputeFromSliceEnd(const vector<MatcherToken> &tokens, idx_t from_
 	return tokens.size();
 }
 
-static vector<reference<ParseResult>> ExtractParseResultsFromList(ParseResult &parse_result) {
-	vector<reference<ParseResult>> result;
+static vector<std::reference_wrapper<ParseResult>> ExtractParseResultsFromList(ParseResult &parse_result) {
+	vector<std::reference_wrapper<ParseResult>> result;
 	auto &list_pr = parse_result.Cast<ListParseResult>();
-	result.push_back(list_pr.GetChild(0));
-	auto &opt_child = list_pr.Child<OptionalParseResult>(1);
+	auto c0 = list_pr.GetChild(0);
+	if (c0) {
+		result.emplace_back(*c0);
+	}
+	auto opt_ptr = list_pr.GetChild(1);
+	if (!opt_ptr) {
+		return result;
+	}
+	auto &opt_child = opt_ptr->Cast<OptionalParseResult>();
 	if (opt_child.HasResult()) {
-		auto &repeat_result = opt_child.GetResult().Cast<RepeatParseResult>();
-		for (auto &child : repeat_result.GetChildren()) {
-			auto &list_child = child.get().Cast<ListParseResult>();
-			result.push_back(list_child.GetChild(1));
+		auto &repeat_result = opt_child.optional_result->Cast<RepeatParseResult>();
+		for (auto &child : repeat_result.children) {
+			if (!child) {
+				continue;
+			}
+			auto &list_child = child->Cast<ListParseResult>();
+			auto c1 = list_child.GetChild(1);
+			if (c1) {
+				result.emplace_back(*c1);
+			}
 		}
 	}
 	return result;
@@ -170,19 +184,29 @@ static string ExtractNthIdentifier(ParseResult &pr, idx_t &remaining) {
 	switch (pr.type) {
 	case ParseResultType::LIST:
 		for (auto &c : pr.Cast<ListParseResult>().GetChildren()) {
-			auto r = ExtractNthIdentifier(c.get(), remaining);
+			if (!c) {
+				continue;
+			}
+			auto r = ExtractNthIdentifier(*c, remaining);
 			if (!r.empty()) {
 				return r;
 			}
 		}
 		break;
-	case ParseResultType::CHOICE:
-		return ExtractNthIdentifier(pr.Cast<ChoiceParseResult>().GetResult(), remaining);
-	case ParseResultType::OPTIONAL:
-		if (pr.Cast<OptionalParseResult>().HasResult()) {
-			return ExtractNthIdentifier(pr.Cast<OptionalParseResult>().GetResult(), remaining);
+	case ParseResultType::CHOICE: {
+		auto &ch = pr.Cast<ChoiceParseResult>();
+		if (ch.result) {
+			return ExtractNthIdentifier(*ch.result, remaining);
 		}
 		break;
+	}
+	case ParseResultType::OPTIONAL: {
+		auto &op = pr.Cast<OptionalParseResult>();
+		if (op.HasResult()) {
+			return ExtractNthIdentifier(*op.optional_result, remaining);
+		}
+		break;
+	}
 	default:
 		break;
 	}
@@ -220,8 +244,11 @@ static void FillVisibleTableFromBaseTableRef(ParseResult &pr, VisibleTable &out)
 	auto &list_pr = pr.Cast<ListParseResult>();
 	// BaseTableRef <- TableAliasColon? BaseTableName TableAlias? AtClause? SampleClause?
 	// Child 1 is BaseTableName.
-	ParseResult &btn_node = list_pr.GetChild(1);
-	out.name = ParseQualifiedNameFromBaseTableName(btn_node);
+	auto btn = list_pr.GetChild(1);
+	if (!btn) {
+		return;
+	}
+	out.name = ParseQualifiedNameFromBaseTableName(*btn);
 	out.alias.clear();
 	if (auto colon = FindDescendantByName(pr, "TableAliasColon")) {
 		out.alias = ExtractFirstIdentifier(*colon);
@@ -240,7 +267,8 @@ static string SynthesizeColumnName(ParseResult &aliased_expr) {
 	// ColIdExpression <- ColId ':' Expression  → take the ColId
 	if (aliased_expr.name == "ColIdExpression") {
 		auto &list = aliased_expr.Cast<ListParseResult>();
-		return ExtractFirstIdentifier(list.GetChild(0));
+		auto ch0 = list.GetChild(0);
+		return ch0 ? ExtractFirstIdentifier(*ch0) : string();
 	}
 	// ExpressionAsCollabel <- Expression 'AS' ColLabelOrString → take ColLabelOrString
 	if (aliased_expr.name == "ExpressionAsCollabel") {
@@ -248,7 +276,8 @@ static string SynthesizeColumnName(ParseResult &aliased_expr) {
 		// child 2 is ColLabelOrString
 		if (list.GetChildren().size() >= 3) {
 			try {
-				return ExtractFirstIdentifier(list.GetChild(2));
+				auto ch2 = list.GetChild(2);
+				return ch2 ? ExtractFirstIdentifier(*ch2) : string();
 			} catch (...) {
 			}
 		}
@@ -262,14 +291,18 @@ static string SynthesizeColumnName(ParseResult &aliased_expr) {
 			auto &opt = list.Child<OptionalParseResult>(1);
 			if (opt.HasResult()) {
 				try {
-					return ExtractFirstIdentifier(opt.GetResult());
+					return ExtractFirstIdentifier(*opt.optional_result);
 				} catch (...) {
 				}
 			}
 		}
 		// Fall back: if the expression itself is a qualified column, take last segment
 		if (!list.GetChildren().empty()) {
-			auto &expr = list.GetChild(0);
+			auto expr_ptr = list.GetChild(0);
+			if (!expr_ptr) {
+				return string();
+			}
+			auto &expr = *expr_ptr;
 			// Walk looking for an identifier chain with dots — take last identifier
 			// We look for the last IdentifierParseResult inside the expression subtree
 			// Strategy: traverse looking for dot-separated chain nodes
@@ -282,27 +315,35 @@ static string SynthesizeColumnName(ParseResult &aliased_expr) {
 				switch (node.type) {
 				case ParseResultType::LIST:
 					for (auto &c : node.Cast<ListParseResult>().GetChildren()) {
-						auto s = last_ident(c.get());
+						if (!c) {
+							continue;
+						}
+						auto s = last_ident(*c);
 						if (!s.empty()) {
 							last = s;
 						}
 					}
 					break;
-				case ParseResultType::CHOICE:
-					last = last_ident(node.Cast<ChoiceParseResult>().GetResult());
-					break;
-				case ParseResultType::OPTIONAL:
-					if (node.Cast<OptionalParseResult>().HasResult()) {
-						last = last_ident(node.Cast<OptionalParseResult>().GetResult());
+				case ParseResultType::CHOICE: {
+					auto &ch = node.Cast<ChoiceParseResult>();
+					if (ch.result) {
+						last = last_ident(*ch.result);
 					}
 					break;
+				}
+				case ParseResultType::OPTIONAL: {
+					auto &op = node.Cast<OptionalParseResult>();
+					if (op.HasResult()) {
+						last = last_ident(*op.optional_result);
+					}
+					break;
+				}
 				default:
 					break;
 				}
 				return last;
 			};
-			auto result = last_ident(expr);
-			return result;
+			return last_ident(expr);
 		}
 	}
 	return string();
@@ -331,7 +372,7 @@ static vector<string> SynthesizeColumnsFromSubquery(ParseResult &subquery_ref, i
 		if (!opt.HasResult()) {
 			return cols;
 		}
-		tl_node = &opt.GetResult();
+		tl_node = opt.optional_result.get();
 	}
 	bool has_star = false;
 	// TargetList <- List(AliasedExpression).
@@ -355,11 +396,12 @@ static vector<string> SynthesizeColumnsFromSubquery(ParseResult &subquery_ref, i
 		if (aliased->type == ParseResultType::LIST && aliased->name == "AliasedExpression") {
 			auto &al = aliased->Cast<ListParseResult>();
 			if (!al.GetChildren().empty()) {
-				aliased = &al.GetChild(0);
+				auto ac = al.GetChild(0);
+				aliased = ac.get();
 			}
 		}
 		if (aliased->type == ParseResultType::CHOICE) {
-			aliased = &aliased->Cast<ChoiceParseResult>().GetResult();
+			aliased = aliased->Cast<ChoiceParseResult>().result.get();
 		}
 		auto name = SynthesizeColumnName(*aliased);
 		if (!name.empty()) {
@@ -409,7 +451,10 @@ static void CollectVisibleRefsRecursive(ParseResult &pr, vector<VisibleTable> &o
 	// ChoiceParseResult inherits its name from the matched child (e.g., "BaseTableRef").
 	// Unwrap CHOICE nodes so the real parse result is passed to named-rule handlers.
 	if (pr.type == ParseResultType::CHOICE) {
-		CollectVisibleRefsRecursive(pr.Cast<ChoiceParseResult>().GetResult(), out, recurse_depth);
+		auto &ch = pr.Cast<ChoiceParseResult>();
+		if (ch.result) {
+			CollectVisibleRefsRecursive(*ch.result, out, recurse_depth);
+		}
 		return;
 	}
 	if (pr.name == "BaseTableRef") {
@@ -443,18 +488,24 @@ static void CollectVisibleRefsRecursive(ParseResult &pr, vector<VisibleTable> &o
 	switch (pr.type) {
 	case ParseResultType::LIST: {
 		for (auto &child : pr.Cast<ListParseResult>().GetChildren()) {
-			CollectVisibleRefsRecursive(child.get(), out, recurse_depth);
+			if (!child) {
+				continue;
+			}
+			CollectVisibleRefsRecursive(*child, out, recurse_depth);
 		}
 		break;
 	}
 	case ParseResultType::OPTIONAL:
 		if (pr.Cast<OptionalParseResult>().HasResult()) {
-			CollectVisibleRefsRecursive(pr.Cast<OptionalParseResult>().GetResult(), out, recurse_depth);
+			CollectVisibleRefsRecursive(*pr.Cast<OptionalParseResult>().optional_result, out, recurse_depth);
 		}
 		break;
 	case ParseResultType::REPEAT:
-		for (auto &child : pr.Cast<RepeatParseResult>().GetChildren()) {
-			CollectVisibleRefsRecursive(child.get(), out, recurse_depth);
+		for (auto &child : pr.Cast<RepeatParseResult>().children) {
+			if (!child) {
+				continue;
+			}
+			CollectVisibleRefsRecursive(*child, out, recurse_depth);
 		}
 		break;
 	default:
@@ -507,7 +558,7 @@ static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
 		ParseResult *icl_node = icl_opt.get();
 		while (icl_node && icl_node->type == ParseResultType::OPTIONAL) {
 			auto &opt = icl_node->Cast<OptionalParseResult>();
-			icl_node = opt.HasResult() ? &opt.GetResult() : nullptr;
+			icl_node = opt.HasResult() ? opt.optional_result.get() : nullptr;
 		}
 		if (icl_node) {
 			vector<string> cols;
@@ -524,20 +575,30 @@ static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
 				switch (node.type) {
 				case ParseResultType::LIST:
 					for (auto &c : node.Cast<ListParseResult>().GetChildren()) {
-						gather(c.get());
+						if (c) {
+							gather(*c);
+						}
 					}
 					break;
-				case ParseResultType::CHOICE:
-					gather(node.Cast<ChoiceParseResult>().GetResult());
-					break;
-				case ParseResultType::OPTIONAL:
-					if (node.Cast<OptionalParseResult>().HasResult()) {
-						gather(node.Cast<OptionalParseResult>().GetResult());
+				case ParseResultType::CHOICE: {
+					auto &ch = node.Cast<ChoiceParseResult>();
+					if (ch.result) {
+						gather(*ch.result);
 					}
 					break;
+				}
+				case ParseResultType::OPTIONAL: {
+					auto &op = node.Cast<OptionalParseResult>();
+					if (op.HasResult()) {
+						gather(*op.optional_result);
+					}
+					break;
+				}
 				case ParseResultType::REPEAT:
-					for (auto &c : node.Cast<RepeatParseResult>().GetChildren()) {
-						gather(c.get());
+					for (auto &c : node.Cast<RepeatParseResult>().children) {
+						if (c) {
+							gather(*c);
+						}
 					}
 					break;
 				default:
@@ -564,7 +625,7 @@ static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
 		if (!opt2.HasResult()) {
 			return cols;
 		}
-		tl_node2 = &opt2.GetResult();
+		tl_node2 = opt2.optional_result.get();
 	}
 	// TargetList <- List(AliasedExpression) — named rule wrapper has one child: the List body.
 	auto &tl_wrapper2 = tl_node2->Cast<ListParseResult>();
@@ -584,11 +645,12 @@ static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
 		if (aliased->type == ParseResultType::LIST && aliased->name == "AliasedExpression") {
 			auto &al = aliased->Cast<ListParseResult>();
 			if (!al.GetChildren().empty()) {
-				aliased = &al.GetChild(0);
+				auto ac = al.GetChild(0);
+				aliased = ac.get();
 			}
 		}
 		if (aliased->type == ParseResultType::CHOICE) {
-			aliased = &aliased->Cast<ChoiceParseResult>().GetResult();
+			aliased = aliased->Cast<ChoiceParseResult>().result.get();
 		}
 		auto name = SynthesizeColumnName(*aliased);
 		if (!name.empty()) {
