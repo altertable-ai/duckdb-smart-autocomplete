@@ -24,6 +24,9 @@
 #include "duckdb/catalog/catalog_entry/pragma_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/catalog/standard_entry.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "tokenizer.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
@@ -177,8 +180,13 @@ static vector<AutoCompleteCandidate> SuggestTableName(ClientContext &context, co
 		return suggestions;
 	}
 	auto all_entries = GetAllTables(context, true);
+	const auto &search_path = *ClientData::Get(context).catalog_search_path;
 	for (auto &entry_ref : all_entries) {
 		auto &entry = entry_ref.get();
+		auto &standard_entry = entry.Cast<StandardEntry>();
+		if (!search_path.SchemaInSearchPath(context, standard_entry.catalog.GetName(), standard_entry.schema.name)) {
+			continue;
+		}
 		int32_t bonus = (entry.internal || entry.type == CatalogType::TABLE_FUNCTION_ENTRY) ? 0 : 1;
 		suggestions.emplace_back(entry.name, SuggestionState::SUGGEST_TABLE_NAME, bonus);
 	}

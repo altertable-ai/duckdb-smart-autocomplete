@@ -344,3 +344,24 @@ SELECT suggestion, suggestion_start FROM sql_smart_auto_complete('SELECT 42; SEL
 ----
 SELECT 	11
 
+# USE catalog: unqualified FROM completes tables in that database's default schema (must stay last: USE persists)
+statement ok
+CREATE TABLE ac_cat.main.tbl_for_use_um(u INTEGER);
+
+statement ok
+USE ac_cat;
+
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM tbl_f', max_suggestion_count => 200) WHERE suggestion = 'tbl_for_use_um' LIMIT 1;
+----
+tbl_for_use_um	table
+
+# USE catalog.schema: unqualified FROM completes tables in that schema
+statement ok
+USE ac_cat.scoped_sch;
+
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM tab_i', max_suggestion_count => 200) WHERE suggestion = 'tab_in_s' LIMIT 1;
+----
+tab_in_s	table
+
