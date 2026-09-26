@@ -135,6 +135,26 @@ static vector<AutoCompleteCandidate> SuggestCatalogName(ClientContext &context) 
 	return suggestions;
 }
 
+static void AppendTablesFromSchema(ClientContext &context, SchemaCatalogEntry &schema_entry,
+                                  vector<AutoCompleteCandidate> &suggestions, int32_t user_table_bonus) {
+	schema_entry.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+		int32_t bonus = (entry.internal || entry.type == CatalogType::TABLE_FUNCTION_ENTRY) ? 0 : user_table_bonus;
+		suggestions.emplace_back(entry.name, SuggestionState::SUGGEST_TABLE_NAME, bonus);
+	});
+	schema_entry.Scan(context, CatalogType::TABLE_FUNCTION_ENTRY, [&](CatalogEntry &entry) {
+		suggestions.emplace_back(entry.name, SuggestionState::SUGGEST_TABLE_NAME, 0);
+	});
+}
+
+//! Schemas the binder searches for `catalog.table` (search path for that catalog, else its default schema).
+static vector<string> SchemasForUnqualifiedCatalogTable(ClientContext &context, AttachedDatabase &db) {
+	auto schemas = ClientData::Get(context).catalog_search_path->GetSchemasForCatalog(db.GetName());
+	if (schemas.empty()) {
+		schemas.push_back(db.GetCatalog().GetDefaultSchema());
+	}
+	return schemas;
+}
+
 static vector<AutoCompleteCandidate> SuggestSchemaName(ClientContext &context, const AutoCompleteFilter &filter) {
 	vector<AutoCompleteCandidate> suggestions;
 	if (!filter.catalog_name.empty()) {
@@ -145,7 +165,8 @@ static vector<AutoCompleteCandidate> SuggestSchemaName(ClientContext &context, c
 		auto schemas = Catalog::GetSchemas(context, filter.catalog_name);
 		for (auto &schema_ref : schemas) {
 			auto &entry = schema_ref.get();
-			AutoCompleteCandidate candidate(entry.name, SuggestionState::SUGGEST_SCHEMA_NAME, 0);
+			// Outrank unfiltered table functions that the grammar also offers after `catalog.`.
+			AutoCompleteCandidate candidate(entry.name, SuggestionState::SUGGEST_SCHEMA_NAME, 2);
 			candidate.extra_char = '.';
 			suggestions.push_back(std::move(candidate));
 		}
@@ -167,16 +188,32 @@ static vector<AutoCompleteCandidate> SuggestTableName(ClientContext &context, co
 		const string catalog_arg = filter.catalog_name.empty() ? string() : filter.catalog_name;
 		optional_ptr<SchemaCatalogEntry> schema_entry =
 		    Catalog::GetSchema(context, catalog_arg, filter.schema_name, OnEntryNotFound::RETURN_NULL);
-		if (!schema_entry) {
+		if (schema_entry) {
+			AppendTablesFromSchema(context, *schema_entry, suggestions, 1);
 			return suggestions;
 		}
-		schema_entry->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-			int32_t bonus = (entry.internal || entry.type == CatalogType::TABLE_FUNCTION_ENTRY) ? 0 : 1;
-			suggestions.emplace_back(entry.name, SuggestionState::SUGGEST_TABLE_NAME, bonus);
-		});
-		schema_entry->Scan(context, CatalogType::TABLE_FUNCTION_ENTRY, [&](CatalogEntry &entry) {
-			suggestions.emplace_back(entry.name, SuggestionState::SUGGEST_TABLE_NAME, 0);
-		});
+		// `catalog.table` is parsed as schema.table. If the qualifier is a catalog, suggest tables the binder
+		// resolves in that catalog (search-path schemas, otherwise the catalog default schema).
+		if (filter.catalog_name.empty()) {
+			auto db = DatabaseManager::Get(context).GetDatabase(context, filter.schema_name);
+			if (db) {
+				case_insensitive_set_t seen;
+				for (auto &schema_name : SchemasForUnqualifiedCatalogTable(context, *db)) {
+					auto default_schema =
+					    Catalog::GetSchema(context, db->GetName(), schema_name, OnEntryNotFound::RETURN_NULL);
+					if (!default_schema) {
+						continue;
+					}
+					vector<AutoCompleteCandidate> chunk;
+					AppendTablesFromSchema(context, *default_schema, chunk, 2);
+					for (auto &candidate : chunk) {
+						if (seen.insert(candidate.candidate).second) {
+							suggestions.push_back(std::move(candidate));
+						}
+					}
+				}
+			}
+		}
 		return suggestions;
 	}
 	auto all_entries = GetAllTables(context, true);
@@ -334,14 +371,32 @@ static vector<AutoCompleteCandidate> SuggestColumnName(ClientContext &context, c
 				}
 			}
 		}
-		// Step 3: schema.table catalog lookup
+		// Step 3: schema.table catalog lookup. A two-part name may be catalog.table (default schema).
 		if (!filter.schema_name.empty()) {
 			const string catalog_arg = filter.catalog_name.empty() ? string() : filter.catalog_name;
-			auto entry = GetCatalogTableOrView(context, catalog_arg, filter.schema_name, filter.table_ref);
-			if (entry) {
-				vector<AutoCompleteCandidate> suggestions;
-				AppendColumnsFromEntry(*entry, suggestions);
-				return suggestions;
+			auto schema_entry =
+			    Catalog::GetSchema(context, catalog_arg, filter.schema_name, OnEntryNotFound::RETURN_NULL);
+			if (schema_entry) {
+				auto entry = GetCatalogTableOrView(context, catalog_arg, filter.schema_name, filter.table_ref);
+				if (entry) {
+					vector<AutoCompleteCandidate> suggestions;
+					AppendColumnsFromEntry(*entry, suggestions);
+					return suggestions;
+				}
+				return {};
+			}
+			if (filter.catalog_name.empty()) {
+				auto db = DatabaseManager::Get(context).GetDatabase(context, filter.schema_name);
+				if (db) {
+					for (auto &schema_name : SchemasForUnqualifiedCatalogTable(context, *db)) {
+						auto entry = GetCatalogTableOrView(context, db->GetName(), schema_name, filter.table_ref);
+						if (entry) {
+							vector<AutoCompleteCandidate> suggestions;
+							AppendColumnsFromEntry(*entry, suggestions);
+							return suggestions;
+						}
+					}
+				}
 			}
 		}
 		return {};

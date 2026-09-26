@@ -320,6 +320,52 @@ SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM a
 ----
 tab_in_s	table
 
+# Trailing dot is a completed qualifier: schema.table, catalog.schema, and catalog.table (default schema)
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM qual_ac.', max_suggestion_count => 200) WHERE suggestion = 'qt_tbl' LIMIT 1;
+----
+qt_tbl	table
+
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('SELECT * FROM qual_ac.', max_suggestion_count => 200) WHERE suggestion = '.';
+----
+0
+
+query I
+SELECT COUNT(*)::BIGINT FROM sql_smart_auto_complete('SELECT * FROM qual_ac.', max_suggestion_count => 200) WHERE suggestion = 'qt_other';
+----
+0
+
+statement ok
+CREATE TABLE ac_cat.main.dot_tbl(u INTEGER);
+
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM ac_cat.', max_suggestion_count => 200) WHERE suggestion IN ('main.', 'scoped_sch.', 'dot_tbl', 'tab_in_s') ORDER BY suggestion;
+----
+dot_tbl	table
+main.	schema
+scoped_sch.	schema
+
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM ac_cat.dot', max_suggestion_count => 200) WHERE suggestion = 'dot_tbl' LIMIT 1;
+----
+dot_tbl	table
+
+query I
+SELECT COUNT(*)::BIGINT FROM sql_smart_auto_complete('SELECT * FROM ac_cat.dot', max_suggestion_count => 200) WHERE suggestion = 'tab_in_s';
+----
+0
+
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT * FROM ac_cat.scoped_sch.', max_suggestion_count => 200) WHERE suggestion = 'tab_in_s' LIMIT 1;
+----
+tab_in_s	table
+
+query II
+SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('SELECT ac_cat.dot_tbl.u', max_suggestion_count => 200) WHERE suggestion = 'u' LIMIT 1;
+----
+u	column
+
 # FromClause slice after leading WITH: same schema-qualified table completion
 query II
 SELECT suggestion, suggestion_type FROM sql_smart_auto_complete('WITH w AS (SELECT 1) SELECT * FROM qual_ac.qt', max_suggestion_count => 200) WHERE suggestion = 'qt_tbl' LIMIT 1;

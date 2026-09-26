@@ -309,6 +309,14 @@ public:
 			last_word_p = last_word_p.substr(1, last_word_p.size() - 1);
 			last_pos_p += 1;
 		}
+		// A bare trailing '.' is tokenized as an incomplete number ('.' starts a numeric literal).
+		// Push it as its own token so `catalog.` / `schema.` suggests the next identifier instead of '.'.
+		if (state == TokenizeState::NUMERIC && last_word_p == ".") {
+			tokens.emplace_back(".", last_pos_p);
+			last_word.clear();
+			last_pos = last_pos_p + 1;
+			return;
+		}
 		last_word = std::move(last_word_p);
 		last_pos = last_pos_p;
 	}

@@ -89,10 +89,11 @@ SELECT suggestion, suggestion_start FROM sql_smart_auto_complete('CREATE TABLE a
 ----
 abcdefgh.	13
 
-query II
-SELECT suggestion, suggestion_start FROM sql_smart_auto_complete('CREATE TABLE abcdefgh.') LIMIT 1;
+# trailing dot completes the qualifier; it is not itself a keyword suggestion
+query I
+SELECT COUNT(*) FROM sql_smart_auto_complete('CREATE TABLE abcdefgh.') WHERE suggestion = '.';
 ----
-.	21
+0
 
 # we suggest the original schema
 query II
