@@ -10,7 +10,7 @@ The implementation is ported from the in-tree `extension/autocomplete` work on [
 | ----------------------------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`sql_smart_auto_complete(sql VARCHAR, ...)`** | Table function | Rows of suggestions with position, type, score, and optional extra character. Named parameters: `max_suggestion_count`, `max_file_suggestion_count`, `max_exact_suggestion_count`. |
 
-This extension registers the same **PEG parser extension** hook as the in-tree `autocomplete` stack so `sql_smart_auto_complete` can resolve the matcher cache.
+The grammar is taken from the connection (`CompiledGrammar::Get`), so grammar extensions loaded by other extensions are honoured. Unlike the 1.x versions, the extension no longer registers a parser override.
 
 ## Quick try
 

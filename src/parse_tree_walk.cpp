@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 
 namespace duckdb {
+namespace smart_autocomplete {
 
 optional_ptr<ParseResult> FindDescendantByName(ParseResult &pr, const string &rule_name) {
 	if (pr.name == rule_name) {
@@ -10,37 +11,26 @@ optional_ptr<ParseResult> FindDescendantByName(ParseResult &pr, const string &ru
 	}
 	switch (pr.type) {
 	case ParseResultType::LIST: {
-		for (auto child : pr.Cast<ListParseResult>().GetChildren()) {
-			if (!child) {
-				continue;
-			}
-			auto found = FindDescendantByName(*child, rule_name);
+		for (auto &child : pr.Cast<ListParseResult>().GetChildren()) {
+			auto found = FindDescendantByName(child.get(), rule_name);
 			if (found) {
 				return found;
 			}
 		}
 		break;
 	}
-	case ParseResultType::CHOICE: {
-		auto &ch = pr.Cast<ChoiceParseResult>();
-		if (ch.result) {
-			return FindDescendantByName(*ch.result, rule_name);
-		}
-		break;
-	}
+	case ParseResultType::CHOICE:
+		return FindDescendantByName(pr.Cast<ChoiceParseResult>().GetResult(), rule_name);
 	case ParseResultType::OPTIONAL: {
 		auto &opt = pr.Cast<OptionalParseResult>();
 		if (opt.HasResult()) {
-			return FindDescendantByName(*opt.optional_result, rule_name);
+			return FindDescendantByName(opt.GetResult(), rule_name);
 		}
 		break;
 	}
 	case ParseResultType::REPEAT: {
-		for (auto child : pr.Cast<RepeatParseResult>().children) {
-			if (!child) {
-				continue;
-			}
-			auto found = FindDescendantByName(*child, rule_name);
+		for (auto &child : pr.Cast<RepeatParseResult>().GetChildren()) {
+			auto found = FindDescendantByName(child.get(), rule_name);
 			if (found) {
 				return found;
 			}
@@ -56,31 +46,30 @@ optional_ptr<ParseResult> FindDescendantByName(ParseResult &pr, const string &ru
 string ExtractFirstIdentifier(ParseResult &pr) {
 	switch (pr.type) {
 	case ParseResultType::IDENTIFIER:
-		return pr.Cast<IdentifierParseResult>().identifier;
+		return pr.Cast<IdentifierParseResult>().identifier.GetIdentifierName();
 	case ParseResultType::STRING:
 		return pr.Cast<StringLiteralParseResult>().GetRawString();
-	case ParseResultType::CHOICE: {
-		auto &ch = pr.Cast<ChoiceParseResult>();
-		if (ch.result) {
-			return ExtractFirstIdentifier(*ch.result);
-		}
-		break;
-	}
+	case ParseResultType::CHOICE:
+		return ExtractFirstIdentifier(pr.Cast<ChoiceParseResult>().GetResult());
+	case ParseResultType::KEYWORD:
+		// unreserved keyword used as an identifier (e.g. ColId <- UnreservedKeyword / ...)
+		return pr.Cast<KeywordParseResult>().keyword;
 	case ParseResultType::LIST: {
-		auto &list_pr = pr.Cast<ListParseResult>();
-		if (list_pr.GetChildren().empty()) {
-			break;
-		}
-		auto c0 = list_pr.GetChild(0);
-		if (c0) {
-			return ExtractFirstIdentifier(*c0);
+		// skip leading keywords (e.g. TableAliasAs <- 'AS' IdentifierOrStringLiteral ColumnAliases?)
+		auto children = pr.Cast<ListParseResult>().GetChildren();
+		for (idx_t i = 0; i < children.size(); i++) {
+			auto &child = children[i].get();
+			if (child.type == ParseResultType::KEYWORD && i + 1 < children.size()) {
+				continue;
+			}
+			return ExtractFirstIdentifier(child);
 		}
 		break;
 	}
 	case ParseResultType::OPTIONAL: {
 		auto &opt = pr.Cast<OptionalParseResult>();
 		if (opt.HasResult()) {
-			return ExtractFirstIdentifier(*opt.optional_result);
+			return ExtractFirstIdentifier(opt.GetResult());
 		}
 		break;
 	}
@@ -91,4 +80,5 @@ string ExtractFirstIdentifier(ParseResult &pr) {
 	                        pr.name);
 }
 
+} // namespace smart_autocomplete
 } // namespace duckdb

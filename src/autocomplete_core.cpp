@@ -1,11 +1,15 @@
 #include "autocomplete_catalog_provider.hpp"
 #include "autocomplete_qualifier.hpp"
-#include "matcher.hpp"
+#include "duckdb/common/allocator.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
-#include "tokenizer.hpp"
+#include "duckdb/common/sql_identifier.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/peg/tokenizer/tokenizer.hpp"
+#include "duckdb/parser/token_iterator.hpp"
+#include "duckdb/storage/arena_allocator.hpp"
 
 namespace duckdb {
+namespace smart_autocomplete {
 
 string GetSuggestionType(SuggestionState type) {
 	switch (type) {
@@ -40,7 +44,7 @@ string GetSuggestionType(SuggestionState type) {
 	}
 }
 
-bool PreferCaseMatching(SuggestionState suggestion_state) {
+static bool PreferCaseMatching(SuggestionState suggestion_state) {
 	switch (suggestion_state) {
 	case SuggestionState::SUGGEST_SCALAR_FUNCTION_NAME:
 	case SuggestionState::SUGGEST_TABLE_FUNCTION_NAME:
@@ -137,7 +141,7 @@ static vector<AutoCompleteSuggestion> ComputeSuggestions(vector<AutoCompleteCand
 				result = StringUtil::Upper(result);
 			}
 		} else if (suggestion.candidate_type == CandidateType::IDENTIFIER) {
-			result = KeywordHelper::WriteOptionallyQuoted(result, '"');
+			result = SQLIdentifier::ToString(result);
 		}
 		if (suggestion.extra_char != '\0') {
 			result += suggestion.extra_char;
@@ -149,160 +153,20 @@ static vector<AutoCompleteSuggestion> ComputeSuggestions(vector<AutoCompleteCand
 	return results;
 }
 
-struct UnicodeSpace {
-	UnicodeSpace(idx_t pos, idx_t bytes) : pos(pos), bytes(bytes) {
-	}
-
-	idx_t pos;
-	idx_t bytes;
-};
-
-bool ReplaceUnicodeSpaces(const string &query, string &new_query, const vector<UnicodeSpace> &unicode_spaces) {
-	if (unicode_spaces.empty()) {
-		// no unicode spaces found
-		return false;
-	}
-	idx_t prev = 0;
-	for (auto &usp : unicode_spaces) {
-		new_query += query.substr(prev, usp.pos - prev);
-		new_query += " ";
-		prev = usp.pos + usp.bytes;
-	}
-	new_query += query.substr(prev, query.size() - prev);
-	return true;
-}
-
-bool IsValidDollarQuotedStringTagFirstChar(const unsigned char &c) {
-	// the first character can be between A-Z, a-z, underscore, or \200 - \377
-	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c >= 0x80;
-}
-
-bool IsValidDollarQuotedStringTagSubsequentChar(const unsigned char &c) {
-	// subsequent characters can also be between 0-9
-	return IsValidDollarQuotedStringTagFirstChar(c) || (c >= '0' && c <= '9');
-}
-
-// This function strips unicode space characters from the query and replaces them with regular spaces
-// It returns true if any unicode space characters were found and stripped
-// See here for a list of unicode space characters - https://jkorpela.fi/chars/spaces.html
-bool StripUnicodeSpaces(const string &query_str, string &new_query) {
-	const idx_t NBSP_LEN = 2;
-	const idx_t USP_LEN = 3;
-	idx_t pos = 0;
-	unsigned char quote;
-	string_t dollar_quote_tag;
-	vector<UnicodeSpace> unicode_spaces;
-	auto query = const_uchar_ptr_cast(query_str.c_str());
-	auto qsize = query_str.size();
-
-regular:
-	for (; pos + 2 < qsize; pos++) {
-		if (query[pos] == 0xC2) {
-			if (query[pos + 1] == 0xA0) {
-				// U+00A0 - C2A0
-				unicode_spaces.emplace_back(pos, NBSP_LEN);
-			}
-		}
-		if (query[pos] == 0xE2) {
-			if (query[pos + 1] == 0x80) {
-				if (query[pos + 2] >= 0x80 && query[pos + 2] <= 0x8B) {
-					// U+2000 to U+200B
-					// E28080 - E2808B
-					unicode_spaces.emplace_back(pos, USP_LEN);
-				} else if (query[pos + 2] == 0xAF) {
-					// U+202F - E280AF
-					unicode_spaces.emplace_back(pos, USP_LEN);
-				}
-			} else if (query[pos + 1] == 0x81) {
-				if (query[pos + 2] == 0x9F) {
-					// U+205F - E2819f
-					unicode_spaces.emplace_back(pos, USP_LEN);
-				} else if (query[pos + 2] == 0xA0) {
-					// U+2060 - E281A0
-					unicode_spaces.emplace_back(pos, USP_LEN);
-				}
-			}
-		} else if (query[pos] == 0xE3) {
-			if (query[pos + 1] == 0x80 && query[pos + 2] == 0x80) {
-				// U+3000 - E38080
-				unicode_spaces.emplace_back(pos, USP_LEN);
-			}
-		} else if (query[pos] == 0xEF) {
-			if (query[pos + 1] == 0xBB && query[pos + 2] == 0xBF) {
-				// U+FEFF - EFBBBF
-				unicode_spaces.emplace_back(pos, USP_LEN);
-			}
-		} else if (query[pos] == '"' || query[pos] == '\'') {
-			quote = query[pos];
-			pos++;
-			goto in_quotes;
-		} else if (query[pos] == '$' &&
-		           (query[pos + 1] == '$' || IsValidDollarQuotedStringTagFirstChar(query[pos + 1]))) {
-			// (optionally tagged) dollar-quoted string
-			auto start = &query[++pos];
-			for (; pos + 2 < qsize; pos++) {
-				if (query[pos] == '$') {
-					// end of tag
-					dollar_quote_tag =
-					    string_t(const_char_ptr_cast(start), NumericCast<uint32_t, int64_t>(&query[pos] - start));
-					goto in_dollar_quotes;
-				}
-
-				if (!IsValidDollarQuotedStringTagSubsequentChar(query[pos])) {
-					// invalid char in dollar-quoted string, continue as normal
-					goto regular;
-				}
-			}
-			goto end;
-		} else if (query[pos] == '-' && query[pos + 1] == '-') {
-			goto in_comment;
-		}
-	}
-	goto end;
-in_quotes:
-	for (; pos + 1 < qsize; pos++) {
-		if (query[pos] == quote) {
-			if (query[pos + 1] == quote) {
-				// escaped quote
-				pos++;
-				continue;
-			}
-			pos++;
-			goto regular;
-		}
-	}
-	goto end;
-in_dollar_quotes:
-	for (; pos + 2 < qsize; pos++) {
-		if (query[pos] == '$' &&
-		    qsize - (pos + 1) >= dollar_quote_tag.GetSize() + 1 && // found '$' and enough space left
-		    query[pos + dollar_quote_tag.GetSize() + 1] == '$' &&  // ending '$' at the right spot
-		    memcmp(&query[pos + 1], dollar_quote_tag.GetData(), dollar_quote_tag.GetSize()) == 0) { // tags match
-			pos += dollar_quote_tag.GetSize() + 1;
-			goto regular;
-		}
-	}
-	goto end;
-in_comment:
-	for (; pos < qsize; pos++) {
-		if (query[pos] == '\n' || query[pos] == '\r') {
-			goto regular;
-		}
-	}
-	goto end;
-end:
-	return ReplaceUnicodeSpaces(query_str, new_query, unicode_spaces);
-}
-
-class AutoCompleteTokenizer : public BaseTokenizer {
+class AutoCompleteTokenizerBehavior : public TokenizerBehavior {
 public:
-	AutoCompleteTokenizer(const string &sql, MatchState &state)
-	    : BaseTokenizer(sql, state.tokens), suggestions(state.suggestions) {
+	AutoCompleteTokenizerBehavior(const string &sql, vector<MatcherToken> &tokens,
+	                              vector<MatcherSuggestion> &suggestions_p)
+	    : TokenizerBehavior(sql, tokens), suggestions(suggestions_p) {
 		last_pos = 0;
 	}
 
-	void OnLastToken(TokenizeState state, string last_word_p, idx_t last_pos_p) override {
-		if (state == TokenizeState::STRING_LITERAL) {
+	TokenType GetTerminator() const override {
+		return TokenType::END_OF_INPUT_AUTOCOMPLETE;
+	}
+
+	void OnLastToken(const Tokenizer &, TokenizeState state, string last_word_p, idx_t last_pos_p) override {
+		if (Tokenizer::TokenizeStateToType(state) == TokenType::STRING_LITERAL) {
 			suggestions.emplace_back(SuggestionState::SUGGEST_FILE_NAME);
 		}
 		if (StringUtil::StartsWith(last_word_p, "'")) {
@@ -312,7 +176,7 @@ public:
 		// A bare trailing '.' is tokenized as an incomplete number ('.' starts a numeric literal).
 		// Push it as its own token so `catalog.` / `schema.` suggests the next identifier instead of '.'.
 		if (state == TokenizeState::NUMERIC && last_word_p == ".") {
-			tokens.emplace_back(".", last_pos_p);
+			tokens.emplace_back(".", last_pos_p, TokenType::OPERATOR);
 			last_word.clear();
 			last_pos = last_pos_p + 1;
 			return;
@@ -333,36 +197,49 @@ public:
 vector<AutoCompleteSuggestion> GenerateAutoCompleteSuggestions(AutoCompleteCatalogProvider &provider, const string &sql,
                                                                AutoCompleteParameters &parameters) {
 	// tokenize the input
+	auto compiled_grammar = provider.GetCompiledGrammar();
 	vector<MatcherToken> tokens;
 	vector<MatcherSuggestion> suggestions;
 	ParseResultAllocator parse_allocator;
 	idx_t max_token_index = 0;
-	MatchState state(tokens, suggestions, parse_allocator, max_token_index);
-	vector<UnicodeSpace> unicode_spaces;
 	string clean_sql;
-	const string &sql_ref = StripUnicodeSpaces(sql, clean_sql) ? clean_sql : sql;
-	AutoCompleteTokenizer tokenizer(sql_ref, state);
-	auto allow_complete = tokenizer.TokenizeInput();
-	if (!allow_complete) {
+	const string &sql_ref = Parser::StripUnicodeSpaces(sql, clean_sql) ? clean_sql : sql;
+	AutoCompleteTokenizerBehavior tokenizer(sql_ref, tokens, suggestions);
+	if (!compiled_grammar->GetTokenizer().TokenizeInput(tokenizer)) {
 		return {};
 	}
-	auto peg_matcher = provider.GetPEGMatcher();
-	if (state.suggestions.empty()) {
+	if (suggestions.empty()) {
 		// no suggestions found during tokenizing
 		// run the root matcher
-		peg_matcher->Root().Match(state);
+		TokenIterator token_iterator(tokens);
+		ArenaAllocator process_allocator(Allocator::DefaultAllocator());
+		MatchContext match_context(suggestions, parse_allocator, process_allocator, max_token_index,
+		                           MatchMode::RECOGNIZE_ONLY, IdentifierCaseMode::PRESERVE_CASE);
+		MatchState state(token_iterator, match_context);
+		compiled_grammar->ProgramMatcher().MatchParseResult(state);
 	}
-	if (state.suggestions.empty()) {
+	if (suggestions.empty()) {
 		return {};
 	}
+	// the tokens before the cursor (without end-of-input sentinels), typed by the matcher run above
+	vector<MatcherToken> context_tokens;
+	for (auto &token : tokens) {
+		if (token.type == TokenType::END_OF_INPUT || token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE) {
+			continue;
+		}
+		context_tokens.push_back(token);
+	}
 	vector<VisibleTable> visible_tables;
-	CollectVisibleTablesFromTokens(peg_matcher->FromClauseRoot(), parse_allocator, tokens, visible_tables);
+	auto qualifier_matchers = GetQualifierMatchers(compiled_grammar);
+	if (qualifier_matchers.from_clause) {
+		CollectVisibleTablesFromTokens(*qualifier_matchers.from_clause, context_tokens, visible_tables);
+	}
 	// Also collect CTE bindings; inner CTEs shadow outer ones (handled inside CollectCTEVisibleTables).
 	// CTE entries are appended after FROM-clause entries so the alias-match loop in SuggestColumnName
 	// sees FROM-scope (subquery aliases) first and CTE aliases second — both are searched anyway.
-	{
+	if (qualifier_matchers.with_clause) {
 		vector<VisibleTable> cte_tables;
-		CollectCTEVisibleTables(peg_matcher->WithClauseRoot(), parse_allocator, tokens, cte_tables);
+		CollectCTEVisibleTables(*qualifier_matchers.with_clause, context_tokens, cte_tables);
 		for (auto &vt : cte_tables) {
 			visible_tables.push_back(std::move(vt));
 		}
@@ -373,9 +250,7 @@ vector<AutoCompleteSuggestion> GenerateAutoCompleteSuggestions(AutoCompleteCatal
 		// run the suggestions
 		vector<AutoCompleteCandidate> new_suggestions;
 		AutoCompleteFilter filter;
-		filter.catalog_name = suggestion.catalog_context;
-		filter.schema_name = suggestion.schema_context;
-		filter.table_ref = suggestion.table_ref;
+		FillQualifierContext(context_tokens, suggestion.type, filter);
 		filter.visible_tables = visible_tables;
 		switch (suggestion.type) {
 		case SuggestionState::SUGGEST_VARIABLE:
@@ -431,4 +306,5 @@ vector<AutoCompleteSuggestion> GenerateAutoCompleteSuggestions(AutoCompleteCatal
 	return ComputeSuggestions(available_suggestions, tokenizer.last_word, parameters);
 }
 
+} // namespace smart_autocomplete
 } // namespace duckdb
