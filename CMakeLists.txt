@@ -9,8 +9,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 
 # Smart autocomplete layer in src/. Since DuckDB 2.0 the PEG grammar, tokenizer,
-# matcher and transformer live in DuckDB core (src/parser/peg), so this extension
-# only compiles its own sources and uses the core headers (duckdb/parser/peg/...).
+# matcher and transformer live in DuckDB core (src/parser/peg), so this
+# extension only compiles its own sources and uses the core headers
+# (duckdb/parser/peg/...).
 include_directories(src/include)
 
 set(AUTOCOMPLETE_EXTENSION_FILES
