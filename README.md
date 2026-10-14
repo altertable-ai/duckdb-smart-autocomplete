@@ -1,8 +1,8 @@
 # DuckDB Smart Autocomplete
 
-Out-of-tree [DuckDB](https://duckdb.org) extension that exposes the experimental **PEG-based SQL autocomplete** stack with catalog-aware suggestions (schemas, tables, columns, functions, files, keywords).
+Out-of-tree [DuckDB](https://duckdb.org) extension that layers **smarter, context-aware SQL autocomplete** on top of DuckDB's PEG parser: qualifier-aware suggestions (`schema.table`, `catalog.schema.table`, `alias.column`, `cte.column`) and column suggestions scoped to the tables, subqueries and CTEs actually visible in `FROM` / `WITH`. DuckDB's built-in `sql_auto_complete` instead suggests every column in the catalog and offers nothing after a qualifier such as `myschema.` or `c.`.
 
-The implementation is ported from the in-tree `extension/autocomplete` work on [duckdb/duckdb](https://github.com/duckdb/duckdb) so it can ship and iterate without waiting for upstream merge.
+Since DuckDB 2.0 the PEG grammar, tokenizer, matcher and transformer live in DuckDB core (`src/parser/peg`); this extension doesn't vendor any of it and only builds on the core headers. See [src/README.md](src/README.md).
 
 ## Main API
 
@@ -18,10 +18,6 @@ The grammar is taken from the connection (`CompiledGrammar::Get`), so grammar ex
 LOAD smart_autocomplete;
 FROM sql_smart_auto_complete('SELECT * FRO');
 ```
-
-## Contributing & community extensions
-
-This repo follows the [DuckDB extension template](https://github.com/duckdb/extension-template) layout (`extension_config.cmake`, `extension-ci-tools`, distribution workflow). To propose listing on community extensions, add a descriptor in [duckdb/community-extensions](https://github.com/duckdb/community-extensions) once your CI produces signed artifacts you are happy with.
 
 ## License
 

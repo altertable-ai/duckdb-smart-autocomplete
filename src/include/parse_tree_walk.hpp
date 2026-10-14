@@ -8,7 +8,10 @@
 
 #pragma once
 
-#include "duckdb/parser/peg/transformer/parse_result.hpp"
+// matcher.hpp defines the inline ParseResult::SetNameFrom(const Matcher &) that
+// ListParseResult's constructor calls. Including only parse_result.hpp leaves that
+// function undefined in this translation unit (-Wundefined-inline).
+#include "duckdb/parser/peg/matcher.hpp"
 
 namespace duckdb {
 namespace smart_autocomplete {
