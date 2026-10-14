@@ -6,7 +6,7 @@ namespace duckdb {
 namespace smart_autocomplete {
 
 optional_ptr<ParseResult> FindDescendantByName(ParseResult &pr, const string &rule_name) {
-	if (pr.name == rule_name) {
+	if (pr.Name() == rule_name) {
 		return optional_ptr<ParseResult>(&pr);
 	}
 	switch (pr.type) {
@@ -77,7 +77,7 @@ string ExtractFirstIdentifier(ParseResult &pr) {
 		break;
 	}
 	throw InternalException("ExtractFirstIdentifier: unexpected node type %s for rule %s", ParseResultToString(pr.type),
-	                        pr.name);
+	                        pr.Name());
 }
 
 } // namespace smart_autocomplete

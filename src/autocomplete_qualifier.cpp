@@ -292,12 +292,12 @@ static constexpr idx_t kMaxSubqueryRecurseDepth = 3;
 // Returns empty string if we can't derive a name.
 static string SynthesizeColumnName(ParseResult &aliased_expr) {
 	// ColIdExpression <- ColId ':' Expression  → take the ColId
-	if (aliased_expr.name == "ColIdExpression") {
+	if (aliased_expr.Name() == "ColIdExpression") {
 		auto &list = aliased_expr.Cast<ListParseResult>();
 		return list.GetChildren().empty() ? string() : ExtractFirstIdentifier(list.GetChild(0));
 	}
 	// ExpressionAsCollabel <- Expression 'AS' ColLabelOrString → take ColLabelOrString
-	if (aliased_expr.name == "ExpressionAsCollabel") {
+	if (aliased_expr.Name() == "ExpressionAsCollabel") {
 		auto &list = aliased_expr.Cast<ListParseResult>();
 		// child 2 is ColLabelOrString
 		if (list.GetChildren().size() >= 3) {
@@ -309,7 +309,7 @@ static string SynthesizeColumnName(ParseResult &aliased_expr) {
 		return string();
 	}
 	// ExpressionOptIdentifier <- Expression Identifier?
-	if (aliased_expr.name == "ExpressionOptIdentifier") {
+	if (aliased_expr.Name() == "ExpressionOptIdentifier") {
 		auto &list = aliased_expr.Cast<ListParseResult>();
 		// child 1 is optional Identifier (the alias without AS)
 		if (list.GetChildren().size() >= 2) {
@@ -407,7 +407,7 @@ static vector<string> SynthesizeColumnsFromSubquery(ParseResult &subquery_ref, i
 		// AliasedExpression is a named rule -> ListParseResult with one child: ChoiceParseResult.
 		// Unwrap: LIST("AliasedExpression") -> CHOICE -> actual alternative.
 		ParseResult *aliased = &item;
-		if (aliased->type == ParseResultType::LIST && aliased->name == "AliasedExpression") {
+		if (aliased->type == ParseResultType::LIST && aliased->Name() == "AliasedExpression") {
 			auto &al = aliased->Cast<ListParseResult>();
 			if (!al.GetChildren().empty()) {
 				aliased = &al.GetChild(0);
@@ -467,13 +467,13 @@ static void CollectVisibleRefsRecursive(ParseResult &pr, vector<VisibleTable> &o
 		CollectVisibleRefsRecursive(pr.Cast<ChoiceParseResult>().GetResult(), out, recurse_depth);
 		return;
 	}
-	if (pr.name == "BaseTableRef") {
+	if (pr.Name() == "BaseTableRef") {
 		VisibleTable vt;
 		FillVisibleTableFromBaseTableRef(pr, vt);
 		out.push_back(std::move(vt));
 		return;
 	}
-	if (pr.name == "TableSubquery") {
+	if (pr.Name() == "TableSubquery") {
 		// TableSubquery <- TableAliasColon? Lateral? SubqueryReference TableAlias?
 		// Only useful if there is an alias (otherwise can't be referenced)
 		string alias_str;
@@ -637,7 +637,7 @@ static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
 		}
 		// AliasedExpression is a named rule -> ListParseResult with one child: ChoiceParseResult.
 		ParseResult *aliased = &item;
-		if (aliased->type == ParseResultType::LIST && aliased->name == "AliasedExpression") {
+		if (aliased->type == ParseResultType::LIST && aliased->Name() == "AliasedExpression") {
 			auto &al = aliased->Cast<ListParseResult>();
 			if (!al.GetChildren().empty()) {
 				aliased = &al.GetChild(0);
