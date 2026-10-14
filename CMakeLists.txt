@@ -8,33 +8,15 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-# Smart autocomplete layer in src/; PEG parser/transformer from DuckDB tree
-# (submodule).
-set(DUCKDB_AUTOCOMPLETE_DIR "${CMAKE_SOURCE_DIR}/extension/autocomplete")
-
-# Patched headers in src/include/ must shadow upstream
-# (matcher, keyword_helper, …).
+# Smart autocomplete layer in src/. Since DuckDB 2.0 the PEG grammar, tokenizer,
+# matcher and transformer live in DuckDB core (src/parser/peg), so this
+# extension only compiles its own sources and uses the core headers
+# (duckdb/parser/peg/...).
 include_directories(src/include)
-include_directories(${DUCKDB_AUTOCOMPLETE_DIR}/include)
-# Upstream sources use `#include "include/parser/...` (expects the extension
-# root on the path).
-include_directories(${DUCKDB_AUTOCOMPLETE_DIR})
 
-# Must be set before parser/transformer subdirs: they append
-# $<TARGET_OBJECTS:...> via PARENT_SCOPE.
 set(AUTOCOMPLETE_EXTENSION_FILES
-    src/autocomplete_extension.cpp
-    src/autocomplete_core.cpp
-    src/autocomplete_qualifier.cpp
-    src/parse_tree_walk.cpp
-    src/matcher.cpp
-    src/keyword_helper.cpp
-    ${DUCKDB_AUTOCOMPLETE_DIR}/keyword_map.cpp)
-
-set(_PEG_BUILD_DIR "${CMAKE_BINARY_DIR}/extension/smart_autocomplete_peg")
-add_subdirectory(${DUCKDB_AUTOCOMPLETE_DIR}/parser ${_PEG_BUILD_DIR}/parser)
-add_subdirectory(${DUCKDB_AUTOCOMPLETE_DIR}/transformer
-                 ${_PEG_BUILD_DIR}/transformer)
+    src/autocomplete_extension.cpp src/autocomplete_core.cpp
+    src/autocomplete_qualifier.cpp src/parse_tree_walk.cpp)
 
 # build_static_extension / build_loadable_extension must be called from the
 # extension root (not from a subdirectory) so the resulting

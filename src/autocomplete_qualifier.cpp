@@ -1,15 +1,53 @@
 #include "autocomplete_qualifier.hpp"
 #include "parse_tree_walk.hpp"
+#include "duckdb/common/allocator.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "keyword_helper.hpp"
-#include "transformer/parse_result.hpp"
+#include "duckdb/parser/peg/compiled_grammar.hpp"
+#include "duckdb/parser/peg/matcher/choice_matcher.hpp"
+#include "duckdb/parser/peg/matcher/list_matcher.hpp"
+#include "duckdb/parser/peg/matcher/optional_matcher.hpp"
+#include "duckdb/parser/peg/matcher/repeat_matcher.hpp"
+#include "duckdb/parser/peg/transformer/parse_result.hpp"
+#include "duckdb/parser/token_iterator.hpp"
+#include "duckdb/storage/arena_allocator.hpp"
+#include <functional>
+#include <mutex>
 
 namespace duckdb {
+namespace smart_autocomplete {
 
 namespace {
+
+//! Inverse of SQL doubled-quote escaping when \p text is wrapped in \p quote; otherwise returns \p text.
+static string TryUnescapeQuotes(const string &text, char quote = '"') {
+	if (text.size() >= 2 && text.front() == quote && text.back() == quote) {
+		return StringUtil::Replace(text.substr(1, text.size() - 2), string(2, quote), string(1, quote));
+	}
+	return text;
+}
+
+//! Match \p tokens (no end-of-input sentinel) against \p root and build its parse tree.
+static optional_ptr<ParseResult> MatchTokens(const Matcher &root, vector<MatcherToken> tokens,
+                                             ParseResultAllocator &allocator) {
+	idx_t end_offset = tokens.empty() ? 0 : tokens.back().offset + tokens.back().length;
+	tokens.emplace_back("", end_offset, TokenType::END_OF_INPUT);
+	vector<MatcherSuggestion> suggestions;
+	idx_t max_token_index = 0;
+	TokenIterator token_iterator(tokens);
+	ArenaAllocator process_allocator(Allocator::DefaultAllocator());
+	MatchContext match_context(suggestions, allocator, process_allocator, max_token_index,
+	                           MatchMode::BUILD_PARSE_RESULT, IdentifierCaseMode::PRESERVE_CASE);
+	MatchState state(token_iterator, match_context);
+	auto result = root.MatchParseResult(state);
+	if (!result.IsSuccess()) {
+		return nullptr;
+	}
+	return result.GetParseResult();
+}
 
 static bool IsDotToken(const MatcherToken &t) {
 	return t.text == ".";
@@ -57,7 +95,7 @@ static vector<string> CollectDottedChainBackwards(const vector<MatcherToken> &to
 		if (!IsPartialCompletionToken(tokens[pos])) {
 			break;
 		}
-		segments.push_back(PEGKeywordHelper::TryUnescapeQuotes(tokens[pos].text));
+		segments.push_back(TryUnescapeQuotes(tokens[pos].text));
 		if (pos == 0) {
 			break;
 		}
@@ -142,16 +180,26 @@ static idx_t ComputeFromSliceEnd(const vector<MatcherToken> &tokens, idx_t from_
 	return tokens.size();
 }
 
+// List(D) <- D (',' D)* ','?  ->  [D, Optional(Repeat(List(',' D))), Optional(',')]
 static vector<reference<ParseResult>> ExtractParseResultsFromList(ParseResult &parse_result) {
 	vector<reference<ParseResult>> result;
 	auto &list_pr = parse_result.Cast<ListParseResult>();
-	result.push_back(list_pr.GetChild(0));
-	auto &opt_child = list_pr.Child<OptionalParseResult>(1);
+	auto children = list_pr.GetChildren();
+	if (children.empty()) {
+		return result;
+	}
+	result.push_back(children[0]);
+	if (children.size() < 2) {
+		return result;
+	}
+	auto &opt_child = children[1].get().Cast<OptionalParseResult>();
 	if (opt_child.HasResult()) {
 		auto &repeat_result = opt_child.GetResult().Cast<RepeatParseResult>();
 		for (auto &child : repeat_result.GetChildren()) {
 			auto &list_child = child.get().Cast<ListParseResult>();
-			result.push_back(list_child.GetChild(1));
+			if (list_child.GetChildren().size() > 1) {
+				result.push_back(list_child.GetChild(1));
+			}
 		}
 	}
 	return result;
@@ -159,59 +207,63 @@ static vector<reference<ParseResult>> ExtractParseResultsFromList(ParseResult &p
 
 // Helper: find nth SchemaName/CatalogName/TableName identifier in a parse tree using
 // a simple counter-based depth-first walk. Returns empty string if not found.
-static string ExtractNthIdentifier(ParseResult &pr, idx_t &remaining) {
-	if (pr.type == ParseResultType::IDENTIFIER) {
-		if (remaining == 0) {
-			return pr.Cast<IdentifierParseResult>().identifier;
-		}
-		remaining--;
-		return string();
-	}
+// Collect all IDENTIFIER leaves of a (qualified) name, in order.
+static void CollectIdentifiers(ParseResult &pr, vector<string> &out) {
 	switch (pr.type) {
+	case ParseResultType::IDENTIFIER:
+		out.push_back(pr.Cast<IdentifierParseResult>().identifier.GetIdentifierName());
+		break;
 	case ParseResultType::LIST:
 		for (auto &c : pr.Cast<ListParseResult>().GetChildren()) {
-			auto r = ExtractNthIdentifier(c.get(), remaining);
-			if (!r.empty()) {
-				return r;
-			}
+			CollectIdentifiers(c.get(), out);
+		}
+		break;
+	case ParseResultType::REPEAT:
+		for (auto &c : pr.Cast<RepeatParseResult>().GetChildren()) {
+			CollectIdentifiers(c.get(), out);
 		}
 		break;
 	case ParseResultType::CHOICE:
-		return ExtractNthIdentifier(pr.Cast<ChoiceParseResult>().GetResult(), remaining);
-	case ParseResultType::OPTIONAL:
-		if (pr.Cast<OptionalParseResult>().HasResult()) {
-			return ExtractNthIdentifier(pr.Cast<OptionalParseResult>().GetResult(), remaining);
+		CollectIdentifiers(pr.Cast<ChoiceParseResult>().GetResult(), out);
+		break;
+	case ParseResultType::OPTIONAL: {
+		auto &op = pr.Cast<OptionalParseResult>();
+		if (op.HasResult()) {
+			CollectIdentifiers(op.GetResult(), out);
 		}
 		break;
+	}
 	default:
 		break;
 	}
-	return string();
 }
 
-static QualifiedName ParseQualifiedNameFromBaseTableName(ParseResult &base_table_name_pr) {
-	QualifiedName qn;
+static TableQualifiedName ParseQualifiedNameFromBaseTableName(ParseResult &base_table_name_pr) {
+	TableQualifiedName qn;
 	if (auto catalog_node = FindDescendantByName(base_table_name_pr, "CatalogReservedSchemaTable")) {
-		// CatalogReservedSchemaTable <- CatalogQualification ReservedSchemaQualification ReservedTableName
-		// Identifiers in order: catalog, schema, table
-		idx_t n0 = 0, n1 = 1, n2 = 2;
-		qn.catalog = ExtractNthIdentifier(*catalog_node, n0);
-		qn.schema = ExtractNthIdentifier(*catalog_node, n1);
-		qn.name = ExtractNthIdentifier(*catalog_node, n2);
+		// CatalogReservedSchemaTable <- CatalogQualification ReservedSchemaQualification+ ReservedTableName
+		// Identifiers in order: catalog, schema(s), table
+		vector<string> ids;
+		CollectIdentifiers(*catalog_node, ids);
+		if (ids.size() >= 3) {
+			qn.catalog = ids.front();
+			qn.schema = ids[ids.size() - 2];
+			qn.name = ids.back();
+		}
 		return qn;
 	}
 	if (auto schema_node = FindDescendantByName(base_table_name_pr, "SchemaReservedTable")) {
 		// SchemaReservedTable <- SchemaQualification ReservedTableName
 		// Identifiers in order: schema, table
-		idx_t n0 = 0, n1 = 1;
-		qn.catalog.clear();
-		qn.schema = ExtractNthIdentifier(*schema_node, n0);
-		qn.name = ExtractNthIdentifier(*schema_node, n1);
+		vector<string> ids;
+		CollectIdentifiers(*schema_node, ids);
+		if (ids.size() >= 2) {
+			qn.schema = ids[0];
+			qn.name = ids[1];
+		}
 		return qn;
 	}
 	// Unqualified table name — just a single identifier
-	qn.catalog.clear();
-	qn.schema.clear();
 	qn.name = ExtractFirstIdentifier(base_table_name_pr);
 	return qn;
 }
@@ -220,8 +272,10 @@ static void FillVisibleTableFromBaseTableRef(ParseResult &pr, VisibleTable &out)
 	auto &list_pr = pr.Cast<ListParseResult>();
 	// BaseTableRef <- TableAliasColon? BaseTableName TableAlias? AtClause? SampleClause?
 	// Child 1 is BaseTableName.
-	ParseResult &btn_node = list_pr.GetChild(1);
-	out.name = ParseQualifiedNameFromBaseTableName(btn_node);
+	if (list_pr.GetChildren().size() < 2) {
+		return;
+	}
+	out.name = ParseQualifiedNameFromBaseTableName(list_pr.GetChild(1));
 	out.alias.clear();
 	if (auto colon = FindDescendantByName(pr, "TableAliasColon")) {
 		out.alias = ExtractFirstIdentifier(*colon);
@@ -238,12 +292,12 @@ static constexpr idx_t kMaxSubqueryRecurseDepth = 3;
 // Returns empty string if we can't derive a name.
 static string SynthesizeColumnName(ParseResult &aliased_expr) {
 	// ColIdExpression <- ColId ':' Expression  → take the ColId
-	if (aliased_expr.name == "ColIdExpression") {
+	if (aliased_expr.Name() == "ColIdExpression") {
 		auto &list = aliased_expr.Cast<ListParseResult>();
-		return ExtractFirstIdentifier(list.GetChild(0));
+		return list.GetChildren().empty() ? string() : ExtractFirstIdentifier(list.GetChild(0));
 	}
 	// ExpressionAsCollabel <- Expression 'AS' ColLabelOrString → take ColLabelOrString
-	if (aliased_expr.name == "ExpressionAsCollabel") {
+	if (aliased_expr.Name() == "ExpressionAsCollabel") {
 		auto &list = aliased_expr.Cast<ListParseResult>();
 		// child 2 is ColLabelOrString
 		if (list.GetChildren().size() >= 3) {
@@ -255,7 +309,7 @@ static string SynthesizeColumnName(ParseResult &aliased_expr) {
 		return string();
 	}
 	// ExpressionOptIdentifier <- Expression Identifier?
-	if (aliased_expr.name == "ExpressionOptIdentifier") {
+	if (aliased_expr.Name() == "ExpressionOptIdentifier") {
 		auto &list = aliased_expr.Cast<ListParseResult>();
 		// child 1 is optional Identifier (the alias without AS)
 		if (list.GetChildren().size() >= 2) {
@@ -276,7 +330,7 @@ static string SynthesizeColumnName(ParseResult &aliased_expr) {
 			// Use a simple recursive leaf-gather and return the last one
 			std::function<string(ParseResult &)> last_ident = [&](ParseResult &node) -> string {
 				if (node.type == ParseResultType::IDENTIFIER) {
-					return node.Cast<IdentifierParseResult>().identifier;
+					return node.Cast<IdentifierParseResult>().identifier.GetIdentifierName();
 				}
 				string last;
 				switch (node.type) {
@@ -291,18 +345,19 @@ static string SynthesizeColumnName(ParseResult &aliased_expr) {
 				case ParseResultType::CHOICE:
 					last = last_ident(node.Cast<ChoiceParseResult>().GetResult());
 					break;
-				case ParseResultType::OPTIONAL:
-					if (node.Cast<OptionalParseResult>().HasResult()) {
-						last = last_ident(node.Cast<OptionalParseResult>().GetResult());
+				case ParseResultType::OPTIONAL: {
+					auto &op = node.Cast<OptionalParseResult>();
+					if (op.HasResult()) {
+						last = last_ident(op.GetResult());
 					}
 					break;
+				}
 				default:
 					break;
 				}
 				return last;
 			};
-			auto result = last_ident(expr);
-			return result;
+			return last_ident(expr);
 		}
 	}
 	return string();
@@ -352,7 +407,7 @@ static vector<string> SynthesizeColumnsFromSubquery(ParseResult &subquery_ref, i
 		// AliasedExpression is a named rule -> ListParseResult with one child: ChoiceParseResult.
 		// Unwrap: LIST("AliasedExpression") -> CHOICE -> actual alternative.
 		ParseResult *aliased = &item;
-		if (aliased->type == ParseResultType::LIST && aliased->name == "AliasedExpression") {
+		if (aliased->type == ParseResultType::LIST && aliased->Name() == "AliasedExpression") {
 			auto &al = aliased->Cast<ListParseResult>();
 			if (!al.GetChildren().empty()) {
 				aliased = &al.GetChild(0);
@@ -412,20 +467,22 @@ static void CollectVisibleRefsRecursive(ParseResult &pr, vector<VisibleTable> &o
 		CollectVisibleRefsRecursive(pr.Cast<ChoiceParseResult>().GetResult(), out, recurse_depth);
 		return;
 	}
-	if (pr.name == "BaseTableRef") {
+	if (pr.Name() == "BaseTableRef") {
 		VisibleTable vt;
 		FillVisibleTableFromBaseTableRef(pr, vt);
 		out.push_back(std::move(vt));
 		return;
 	}
-	if (pr.name == "TableSubquery") {
-		// TableSubquery <- Lateral? SubqueryReference TableAlias?
-		// Only useful if there is a TableAlias (otherwise can't be referenced)
-		auto talias = FindDescendantByName(pr, "TableAlias");
-		if (!talias) {
-			return;
+	if (pr.Name() == "TableSubquery") {
+		// TableSubquery <- TableAliasColon? Lateral? SubqueryReference TableAlias?
+		// Only useful if there is an alias (otherwise can't be referenced)
+		string alias_str;
+		if (auto colon = FindDescendantByName(pr, "TableAliasColon")) {
+			alias_str = ExtractFirstIdentifier(*colon);
 		}
-		auto alias_str = ExtractFirstIdentifier(*talias);
+		if (auto talias = FindDescendantByName(pr, "TableAlias")) {
+			alias_str = ExtractFirstIdentifier(*talias);
+		}
 		if (alias_str.empty()) {
 			return;
 		}
@@ -464,8 +521,8 @@ static void CollectVisibleRefsRecursive(ParseResult &pr, vector<VisibleTable> &o
 
 } // namespace
 
-void CollectVisibleTablesFromTokens(Matcher &from_clause_root, ParseResultAllocator &allocator,
-                                    const vector<MatcherToken> &tokens, vector<VisibleTable> &visible_tables) {
+void CollectVisibleTablesFromTokens(const Matcher &from_clause_root, const vector<MatcherToken> &tokens,
+                                    vector<VisibleTable> &visible_tables) {
 	visible_tables.clear();
 	try {
 		const idx_t from_idx = FindEnclosingFromKeyword(tokens);
@@ -476,10 +533,8 @@ void CollectVisibleTablesFromTokens(Matcher &from_clause_root, ParseResultAlloca
 		auto begin_it = tokens.begin();
 		vector<MatcherToken> slice(begin_it + NumericCast<std::ptrdiff_t>(from_idx),
 		                           begin_it + NumericCast<std::ptrdiff_t>(slice_end));
-		vector<MatcherSuggestion> dummy_suggestions;
-		idx_t max_token_index = 0;
-		MatchState sub_state(slice, dummy_suggestions, allocator, max_token_index);
-		auto parse_root = from_clause_root.MatchParseResult(sub_state);
+		ParseResultAllocator allocator;
+		auto parse_root = MatchTokens(from_clause_root, std::move(slice), allocator);
 		if (!parse_root) {
 			return;
 		}
@@ -494,15 +549,14 @@ void CollectVisibleTablesFromTokens(Matcher &from_clause_root, ParseResultAlloca
 }
 
 // Synthesize column names from a CTEBody.
-// WithStatement <- ColIdOrString InsertColumnList? UsingKey? 'AS' Materialized? CTEBody
-// CTEBody <- Parens(CTEBodyContent)
-// CTEBodyContent <- SelectStatementInternal / Statement
+// WithStatement <- ColIdOrString ColumnAliases? UsingKey? 'AS' Materialized? CTEBody
+// CTEBody <- CTESelectBody / CTEDMLBody
 static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
-	// Check for explicit InsertColumnList first
-	// InsertColumnList <- Parens(List(ColIdOrString))
-	auto icl_opt = FindDescendantByName(with_statement, "InsertColumnList");
+	// Check for explicit column aliases first
+	// ColumnAliases <- Parens(List(ColIdOrString))
+	auto icl_opt = FindDescendantByName(with_statement, "ColumnAliases");
 	if (icl_opt) {
-		// InsertColumnList? in WithStatement wraps the node in an OptionalParseResult.
+		// ColumnAliases? in WithStatement may wrap the node in an OptionalParseResult.
 		// Unwrap the Optional, then walk the resulting node for all identifiers.
 		ParseResult *icl_node = icl_opt.get();
 		while (icl_node && icl_node->type == ParseResultType::OPTIONAL) {
@@ -511,10 +565,10 @@ static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
 		}
 		if (icl_node) {
 			vector<string> cols;
-			// Walk to find all identifiers inside InsertColumnList <- Parens(List(ColIdOrString))
+			// Walk to find all identifiers inside ColumnAliases <- Parens(List(ColIdOrString))
 			std::function<void(ParseResult &)> gather = [&](ParseResult &node) {
 				if (node.type == ParseResultType::IDENTIFIER) {
-					cols.push_back(node.Cast<IdentifierParseResult>().identifier);
+					cols.push_back(node.Cast<IdentifierParseResult>().identifier.GetIdentifierName());
 					return;
 				}
 				if (node.type == ParseResultType::STRING) {
@@ -530,11 +584,13 @@ static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
 				case ParseResultType::CHOICE:
 					gather(node.Cast<ChoiceParseResult>().GetResult());
 					break;
-				case ParseResultType::OPTIONAL:
-					if (node.Cast<OptionalParseResult>().HasResult()) {
-						gather(node.Cast<OptionalParseResult>().GetResult());
+				case ParseResultType::OPTIONAL: {
+					auto &op = node.Cast<OptionalParseResult>();
+					if (op.HasResult()) {
+						gather(op.GetResult());
 					}
 					break;
+				}
 				case ParseResultType::REPEAT:
 					for (auto &c : node.Cast<RepeatParseResult>().GetChildren()) {
 						gather(c.get());
@@ -581,7 +637,7 @@ static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
 		}
 		// AliasedExpression is a named rule -> ListParseResult with one child: ChoiceParseResult.
 		ParseResult *aliased = &item;
-		if (aliased->type == ParseResultType::LIST && aliased->name == "AliasedExpression") {
+		if (aliased->type == ParseResultType::LIST && aliased->Name() == "AliasedExpression") {
 			auto &al = aliased->Cast<ListParseResult>();
 			if (!al.GetChildren().empty()) {
 				aliased = &al.GetChild(0);
@@ -598,8 +654,8 @@ static vector<string> SynthesizeCTEColumns(ParseResult &with_statement) {
 	return cols;
 }
 
-void CollectCTEVisibleTables(Matcher &with_clause_root, ParseResultAllocator &allocator,
-                             const vector<MatcherToken> &tokens, vector<VisibleTable> &visible_tables) {
+void CollectCTEVisibleTables(const Matcher &with_clause_root, const vector<MatcherToken> &tokens,
+                             vector<VisibleTable> &visible_tables) {
 	// Compute the cursor's paren depth
 	idx_t cursor_depth = 0;
 	for (auto &t : tokens) {
@@ -643,10 +699,8 @@ void CollectCTEVisibleTables(Matcher &with_clause_root, ParseResultAllocator &al
 			vector<MatcherToken> slice(begin_it + NumericCast<std::ptrdiff_t>(i),
 			                           begin_it + NumericCast<std::ptrdiff_t>(slice_end));
 			try {
-				vector<MatcherSuggestion> dummy_suggestions;
-				idx_t max_token_index = 0;
-				MatchState sub_state(slice, dummy_suggestions, allocator, max_token_index);
-				auto parse_root = with_clause_root.MatchParseResult(sub_state);
+				ParseResultAllocator allocator;
+				auto parse_root = MatchTokens(with_clause_root, std::move(slice), allocator);
 				if (!parse_root) {
 					continue;
 				}
@@ -659,7 +713,7 @@ void CollectCTEVisibleTables(Matcher &with_clause_root, ParseResultAllocator &al
 				auto stmt_items = ExtractParseResultsFromList(*with_stmts_list);
 				for (auto &stmt_ref : stmt_items) {
 					ParseResult &stmt = stmt_ref.get();
-					// WithStatement <- ColIdOrString InsertColumnList? UsingKey? 'AS' Materialized? CTEBody
+					// WithStatement <- ColIdOrString ColumnAliases? UsingKey? 'AS' Materialized? CTEBody
 					auto name_node = FindDescendantByName(stmt, "ColIdOrString");
 					if (!name_node) {
 						continue;
@@ -689,42 +743,38 @@ void CollectCTEVisibleTables(Matcher &with_clause_root, ParseResultAllocator &al
 	}
 }
 
-void FillMatcherQualifierContext(const vector<MatcherToken> &tokens, SuggestionState type,
-                                 MatcherSuggestion &suggestion) {
+void FillQualifierContext(const vector<MatcherToken> &tokens, SuggestionState type, AutoCompleteFilter &filter) {
+	filter.catalog_name.clear();
+	filter.schema_name.clear();
+	filter.table_ref.clear();
 	switch (type) {
 	case SuggestionState::SUGGEST_TABLE_NAME: {
 		auto segs = CollectDottedChainBackwards(tokens, 2);
-		suggestion.catalog_context.clear();
-		suggestion.schema_context.clear();
 		if (segs.size() >= 1) {
-			suggestion.schema_context = segs[0];
+			filter.schema_name = segs[0];
 		}
 		if (segs.size() >= 2) {
-			suggestion.catalog_context = segs[1];
+			filter.catalog_name = segs[1];
 		}
 		break;
 	}
 	case SuggestionState::SUGGEST_SCHEMA_NAME: {
 		auto segs = CollectDottedChainBackwards(tokens, 1);
-		suggestion.catalog_context.clear();
 		if (!segs.empty()) {
-			suggestion.catalog_context = segs[0];
+			filter.catalog_name = segs[0];
 		}
 		break;
 	}
 	case SuggestionState::SUGGEST_COLUMN_NAME: {
 		auto segs = CollectDottedChainBackwards(tokens, 3);
-		suggestion.catalog_context.clear();
-		suggestion.schema_context.clear();
-		suggestion.table_ref.clear();
 		if (segs.size() >= 1) {
-			suggestion.table_ref = segs[0];
+			filter.table_ref = segs[0];
 		}
 		if (segs.size() >= 2) {
-			suggestion.schema_context = segs[1];
+			filter.schema_name = segs[1];
 		}
 		if (segs.size() >= 3) {
-			suggestion.catalog_context = segs[2];
+			filter.catalog_name = segs[2];
 		}
 		break;
 	}
@@ -733,4 +783,63 @@ void FillMatcherQualifierContext(const vector<MatcherToken> &tokens, SuggestionS
 	}
 }
 
+static QualifierMatchers FindQualifierMatchers(const CompiledGrammar &grammar) {
+	QualifierMatchers result;
+	reference_set_t<const Matcher> visited;
+	vector<reference<const Matcher>> pending;
+	pending.push_back(grammar.ProgramMatcher());
+	while (!pending.empty() && (!result.from_clause || !result.with_clause)) {
+		auto &matcher = pending.back().get();
+		pending.pop_back();
+		if (!visited.insert(matcher).second) {
+			continue;
+		}
+		auto rule = matcher.GetRule();
+		if (rule && matcher.Type() == MatcherType::LIST) {
+			if (!result.from_clause && StringUtil::CIEquals(rule->name, "FromClause")) {
+				result.from_clause = &matcher;
+			} else if (!result.with_clause && StringUtil::CIEquals(rule->name, "WithClause")) {
+				result.with_clause = &matcher;
+			}
+		}
+		switch (matcher.Type()) {
+		case MatcherType::LIST:
+			for (auto &child : matcher.Cast<ListMatcher>().matchers) {
+				pending.push_back(child.get());
+			}
+			break;
+		case MatcherType::CHOICE:
+			for (auto &child : matcher.Cast<ChoiceMatcher>().matchers) {
+				pending.push_back(child.get());
+			}
+			break;
+		case MatcherType::OPTIONAL:
+			pending.push_back(matcher.Cast<OptionalMatcher>().GetChildMatcher());
+			break;
+		case MatcherType::REPEAT:
+			pending.push_back(matcher.Cast<RepeatMatcher>().GetChildMatcher());
+			break;
+		default:
+			break;
+		}
+	}
+	return result;
+}
+
+QualifierMatchers GetQualifierMatchers(const shared_ptr<CompiledGrammar> &grammar) {
+	// The matcher graph is immutable once compiled; remember the lookup for the most recent grammar.
+	static std::mutex cache_lock;
+	static weak_ptr<CompiledGrammar> cached_grammar;
+	static QualifierMatchers cached_matchers;
+	std::lock_guard<std::mutex> guard(cache_lock);
+	auto cached = cached_grammar.lock();
+	if (cached && cached.get() == grammar.get()) {
+		return cached_matchers;
+	}
+	cached_matchers = FindQualifierMatchers(*grammar);
+	cached_grammar = grammar;
+	return cached_matchers;
+}
+
+} // namespace smart_autocomplete
 } // namespace duckdb

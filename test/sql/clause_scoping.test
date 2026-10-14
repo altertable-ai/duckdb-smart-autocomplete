@@ -1,0 +1,53 @@
+# name: test/sql/clause_scoping.test
+# description: Column suggestions are scoped to the relations of the FROM / WITH clauses
+# group: [sql]
+
+# Scoping relies on finding the core grammar rules "FromClause" and "WithClause" by name (FindQualifierMatchers).
+# If upstream renames them, the lookup silently comes back empty and completion falls back to the columns of every
+# table, and alias / CTE qualifiers stop resolving. Each assertion below fails in that fallback.
+
+require smart_autocomplete
+
+statement ok
+CREATE TABLE scope_orders(order_id INTEGER, order_total INTEGER);
+
+statement ok
+CREATE TABLE scope_users(user_id INTEGER, user_email VARCHAR);
+
+# FromClause: unqualified columns come from the FROM relation only
+query I
+SELECT suggestion FROM sql_smart_auto_complete('SELECT * FROM scope_orders WHERE ', max_suggestion_count => 500) WHERE suggestion_type = 'column' AND (suggestion LIKE 'order%' OR suggestion LIKE 'user%') ORDER BY suggestion;
+----
+order_id
+order_total
+
+# FromClause: a table alias resolves to its table
+query I
+SELECT suggestion FROM sql_smart_auto_complete('SELECT * FROM scope_orders o WHERE o.', max_suggestion_count => 500) WHERE suggestion_type = 'column' ORDER BY suggestion;
+----
+order_id
+order_total
+
+# FromClause: columns projected by a subquery are suggested, and catalog columns are not
+query I
+SELECT suggestion FROM sql_smart_auto_complete('SELECT * FROM (SELECT 1 AS sub_col) sq WHERE sub_', max_suggestion_count => 500) WHERE suggestion_type = 'column' AND (suggestion LIKE 'sub%' OR suggestion LIKE 'order%' OR suggestion LIKE 'user%') ORDER BY suggestion;
+----
+sub_col
+
+# WithClause: CTE columns are suggested in the main query's WHERE, and catalog columns are not
+query I
+SELECT suggestion FROM sql_smart_auto_complete('WITH c AS (SELECT 1 AS cte_col) SELECT * FROM c WHERE cte_', max_suggestion_count => 500) WHERE suggestion_type = 'column' AND (suggestion LIKE 'cte%' OR suggestion LIKE 'order%' OR suggestion LIKE 'user%') ORDER BY suggestion;
+----
+cte_col
+
+# WithClause: a CTE name resolves as a qualifier
+query I
+SELECT suggestion FROM sql_smart_auto_complete('WITH c AS (SELECT 1 AS cte_col) SELECT * FROM c WHERE c.', max_suggestion_count => 500) WHERE suggestion_type = 'column' ORDER BY suggestion;
+----
+cte_col
+
+# WithClause: CTE columns are suggested in a select list that has no FROM clause yet
+query I
+SELECT suggestion FROM sql_smart_auto_complete('WITH c AS (SELECT 1 AS cte_col) SELECT cte_', max_suggestion_count => 500) WHERE suggestion_type = 'column' AND (suggestion LIKE 'cte%' OR suggestion LIKE 'order%' OR suggestion LIKE 'user%') ORDER BY suggestion;
+----
+cte_col
