@@ -39,6 +39,7 @@ string GetSuggestionType(SuggestionState type) {
 		return "setting";
 	case SuggestionState::SUGGEST_RESERVED_VARIABLE:
 	case SuggestionState::SUGGEST_VARIABLE:
+	case SuggestionState::SUGGEST_BARE_LABEL:
 	default:
 		return "";
 	}
@@ -254,7 +255,8 @@ vector<AutoCompleteSuggestion> GenerateAutoCompleteSuggestions(AutoCompleteCatal
 		filter.visible_tables = visible_tables;
 		switch (suggestion.type) {
 		case SuggestionState::SUGGEST_VARIABLE:
-			// variables have no suggestions available
+		case SuggestionState::SUGGEST_BARE_LABEL:
+			// variables and bare labels have no suggestions available
 			break;
 		case SuggestionState::SUGGEST_KEYWORD:
 			new_suggestions.emplace_back(suggestion.keyword);
