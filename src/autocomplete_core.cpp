@@ -156,9 +156,8 @@ static vector<AutoCompleteSuggestion> ComputeSuggestions(vector<AutoCompleteCand
 
 class AutoCompleteTokenizerBehavior : public TokenizerBehavior {
 public:
-	AutoCompleteTokenizerBehavior(const string &sql, vector<MatcherToken> &tokens,
-	                              vector<MatcherSuggestion> &suggestions_p)
-	    : TokenizerBehavior(sql, tokens), suggestions(suggestions_p) {
+	AutoCompleteTokenizerBehavior(const string &sql, vector<MatcherSuggestion> &suggestions_p)
+	    : TokenizerBehavior(sql), suggestions(suggestions_p) {
 		last_pos = 0;
 	}
 
@@ -199,16 +198,16 @@ vector<AutoCompleteSuggestion> GenerateAutoCompleteSuggestions(AutoCompleteCatal
                                                                AutoCompleteParameters &parameters) {
 	// tokenize the input
 	auto compiled_grammar = provider.GetCompiledGrammar();
-	vector<MatcherToken> tokens;
 	vector<MatcherSuggestion> suggestions;
 	ParseResultAllocator parse_allocator;
 	idx_t max_token_index = 0;
 	string clean_sql;
 	const string &sql_ref = Parser::StripUnicodeSpaces(sql, clean_sql) ? clean_sql : sql;
-	AutoCompleteTokenizerBehavior tokenizer(sql_ref, tokens, suggestions);
+	AutoCompleteTokenizerBehavior tokenizer(sql_ref, suggestions);
 	if (!compiled_grammar->GetTokenizer().TokenizeInput(tokenizer)) {
 		return {};
 	}
+	auto tokens = std::move(tokenizer.tokens);
 	if (suggestions.empty()) {
 		// no suggestions found during tokenizing
 		// run the root matcher

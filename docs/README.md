@@ -28,7 +28,7 @@ DuckDB extensions can use [vcpkg](https://vcpkg.io/) when listed in `vcpkg.json`
 
 | Submodule            | Repository                                                                                  |
 | -------------------- | ------------------------------------------------------------------------------------------- |
-| `duckdb`             | Core DuckDB sources ([duckdb/duckdb](https://github.com/duckdb/duckdb) `v2.0-cyanoptera`)   |
+| `duckdb`             | Core DuckDB sources ([duckdb/duckdb](https://github.com/duckdb/duckdb) `v2.0.1`)            |
 | `extension-ci-tools` | [duckdb/extension-ci-tools](https://github.com/duckdb/extension-ci-tools)                   |
 
 ```bash
